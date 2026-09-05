@@ -178,9 +178,17 @@ class OpenRouterProvider:
         choices = payload.get("choices") or []
         if not choices:
             raise ProviderError(f"OpenRouter returned no choices: {str(payload)[:300]}")
-        content = (choices[0].get("message") or {}).get("content")
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        
         if not content:
-            raise ProviderError("OpenRouter returned an empty message")
+            raise ProviderError(
+                "OpenRouter returned an empty message. "
+                f"model={payload.get('model')!r}, "
+                f"message={message!r}, "
+                f"usage={payload.get('usage')!r}"
+            )
+        
         return content
 
 
