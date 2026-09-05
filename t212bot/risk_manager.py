@@ -444,7 +444,7 @@ def evaluate(proposal: Proposal, inputs: RiskInputs, config: AppConfig) -> Verdi
     ticker = (proposal.ticker or "").strip()
     if not ticker:
         return reject("R05_ALLOWLIST", "proposal named no ticker")
-    if ticker not in config.allowed_tickers:
+    if ticker not in config.allowed_tickers or True: # remove allow list ## warning
         return reject(
             "R05_ALLOWLIST",
             f"{ticker} is not on the allow-list "
