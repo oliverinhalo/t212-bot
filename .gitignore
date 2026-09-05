@@ -1,0 +1,21 @@
+# Secrets — never commit
+.env
+*.pem
+
+# Local runtime state
+config.yaml
+data/
+*.sqlite3
+*.sqlite3-journal
+*.log
+STOP
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/

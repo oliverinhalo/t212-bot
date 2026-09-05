@@ -1,0 +1,247 @@
+"""Prompt construction and defensive parsing of model output."""
+
+from __future__ import annotations
+
+import json
+from datetime import date, timedelta
+
+from t212bot.ai_advisor import (
+    OpenRouterProvider,
+    StubProvider,
+    advise,
+    build_prompt,
+    parse_proposal,
+)
+from t212bot.market_data import Snapshot
+from t212bot.models import Bar, PriceHistory, dec
+
+from conftest import OTHER, TICKER, make_account, make_config, make_position, make_quote
+
+
+def snapshot(prices=None, missing=()) -> Snapshot:
+    prices = prices or {TICKER: dec(10), OTHER: dec(7)}
+    quotes = {t: make_quote(t, p) for t, p in prices.items()}
+    start = date(2026, 1, 1)
+    histories = {
+        t: PriceHistory(
+            ticker=t,
+            bars=tuple(
+                Bar(day=start + timedelta(days=i), close=dec(10) + dec(i) / 10)
+                for i in range(25)
+            ),
+        )
+        for t in prices
+    }
+    return Snapshot(quotes=quotes, histories=histories, errors={t: "no data" for t in missing})
+
+
+# --------------------------------------------------------------------------- #
+# Parsing
+# --------------------------------------------------------------------------- #
+
+
+def test_parses_a_clean_json_object():
+    raw = json.dumps(
+        {
+            "action": "buy",
+            "ticker": TICKER,
+            "notional_or_qty": 12.5,
+            "size_unit": "gbp",
+            "price": 10.2,
+            "confidence": 0.82,
+            "reasoning": "trend is up",
+        }
+    )
+    proposal = parse_proposal(raw)
+    assert proposal.action == "buy"
+    assert proposal.ticker == TICKER
+    assert proposal.notional == dec("12.5")
+    assert proposal.quantity is None
+    assert proposal.price == dec("10.2")
+    assert proposal.confidence == dec("0.82")
+
+
+def test_parses_json_inside_a_markdown_fence():
+    raw = '```json\n{"action": "hold", "confidence": 1, "reasoning": "wait"}\n```'
+    assert parse_proposal(raw).action == "hold"
+
+
+def test_parses_json_after_leading_prose():
+    raw = 'Sure! Here is my answer:\n{"action": "sell", "ticker": "X", "confidence": 0.9}'
+    proposal = parse_proposal(raw)
+    assert proposal.action == "sell"
+    assert proposal.ticker == "X"
+
+
+def test_shares_unit_is_read_as_a_quantity():
+    raw = json.dumps(
+        {"action": "buy", "ticker": TICKER, "notional_or_qty": 3, "size_unit": "shares",
+         "confidence": 0.9}
+    )
+    proposal = parse_proposal(raw)
+    assert proposal.quantity == dec(3)
+    assert proposal.notional is None
+
+
+def test_missing_size_unit_defaults_to_money():
+    """Reading £10 as 10 shares would be a far bigger order than intended."""
+    raw = json.dumps({"action": "buy", "ticker": TICKER, "notional_or_qty": 10, "confidence": 0.9})
+    proposal = parse_proposal(raw)
+    assert proposal.notional == dec(10)
+    assert proposal.quantity is None
+
+
+def test_unparseable_output_becomes_a_hold():
+    proposal = parse_proposal("I'm afraid I can't help with that.")
+    assert proposal.action == "hold"
+    assert "unparseable" in proposal.reasoning
+
+
+def test_empty_output_becomes_a_hold():
+    assert parse_proposal("").action == "hold"
+
+
+def test_unknown_action_becomes_a_hold():
+    raw = json.dumps({"action": "short", "ticker": TICKER, "confidence": 1})
+    proposal = parse_proposal(raw)
+    assert proposal.action == "hold"
+
+
+def test_confidence_is_clamped_to_zero_and_one():
+    assert parse_proposal(json.dumps({"action": "hold", "confidence": 42})).confidence == dec(1)
+    assert parse_proposal(json.dumps({"action": "hold", "confidence": -3})).confidence == dec(0)
+
+
+def test_garbage_confidence_becomes_zero():
+    raw = json.dumps({"action": "buy", "ticker": TICKER, "confidence": "very high"})
+    assert parse_proposal(raw).confidence == dec(0)
+
+
+def test_null_ticker_is_none():
+    assert parse_proposal(json.dumps({"action": "hold", "ticker": None})).ticker is None
+
+
+def test_negative_size_is_dropped_rather_than_flipping_the_side():
+    raw = json.dumps({"action": "buy", "ticker": TICKER, "notional_or_qty": -50, "confidence": 1})
+    proposal = parse_proposal(raw)
+    assert proposal.notional is None
+    assert proposal.quantity is None
+
+
+def test_nonsense_price_is_ignored():
+    raw = json.dumps({"action": "buy", "ticker": TICKER, "price": 0, "confidence": 1})
+    assert parse_proposal(raw).price is None
+
+
+def test_reasoning_is_truncated():
+    raw = json.dumps({"action": "hold", "reasoning": "x" * 5000})
+    assert len(parse_proposal(raw).reasoning) <= 600
+
+
+def test_two_json_objects_takes_the_first():
+    raw = '{"action": "hold", "confidence": 1}\n{"action": "buy", "ticker": "X"}'
+    assert parse_proposal(raw).action == "hold"
+
+
+# --------------------------------------------------------------------------- #
+# Prompt
+# --------------------------------------------------------------------------- #
+
+
+def test_prompt_lists_only_allow_listed_tickers():
+    config = make_config()
+    prompt = build_prompt(
+        config, make_account(cash=50), snapshot(), trades_today=0, day_pnl=dec(0)
+    )
+    assert TICKER in prompt
+    assert OTHER in prompt
+    assert "TSLA" not in prompt
+
+
+def test_prompt_states_the_caps_and_the_budget_used():
+    config = make_config(max_capital=50)
+    prompt = build_prompt(
+        config, make_account(cash=50), snapshot(), trades_today=3, day_pnl=dec("-1.25")
+    )
+    assert "50.00" in prompt
+    assert "12.50" in prompt  # per-trade cap
+    assert "3 of 5" in prompt
+    assert "-1.25" in prompt
+
+
+def test_prompt_marks_tickers_with_no_price_as_untradeable():
+    config = make_config()
+    prompt = build_prompt(
+        config,
+        make_account(cash=50),
+        snapshot(prices={TICKER: dec(10)}, missing=[OTHER]),
+        trades_today=0,
+        day_pnl=dec(0),
+    )
+    assert "NO PRICE AVAILABLE" in prompt
+
+
+def test_prompt_shows_open_positions():
+    config = make_config()
+    account = make_account(cash=40, positions=[make_position(quantity=1, current_price=10)])
+    prompt = build_prompt(config, account, snapshot(), trades_today=0, day_pnl=dec(0))
+    assert "held 1" in prompt
+
+
+def test_prompt_is_deterministic_for_the_same_inputs():
+    config = make_config()
+    snap = snapshot()
+    account = make_account(cash=50)
+    first = build_prompt(config, account, snap, trades_today=0, day_pnl=dec(0))
+    second = build_prompt(config, account, snap, trades_today=0, day_pnl=dec(0))
+    assert first == second
+
+
+# --------------------------------------------------------------------------- #
+# advise()
+# --------------------------------------------------------------------------- #
+
+
+def test_stub_provider_always_holds():
+    config = make_config()
+    result = advise(
+        StubProvider(), config, make_account(), snapshot(), trades_today=0, day_pnl=dec(0)
+    )
+    assert result.proposal.action == "hold"
+    assert result.error is None
+    assert result.prompt
+
+
+def test_a_provider_failure_degrades_to_hold_rather_than_crashing():
+    class Broken:
+        name = "broken"
+        model = "none"
+
+        def complete(self, system, user):
+            from t212bot.ai_advisor import ProviderError
+
+            raise ProviderError("network down")
+
+    result = advise(
+        Broken(), make_config(), make_account(), snapshot(), trades_today=0, day_pnl=dec(0)
+    )
+    assert result.proposal.action == "hold"
+    assert result.error == "network down"
+    assert "AI unavailable" in result.proposal.reasoning
+
+
+def test_the_raw_response_is_preserved_for_the_audit_log():
+    provider = StubProvider(response='{"action": "hold", "reasoning": "verbatim"}')
+    result = advise(
+        provider, make_config(), make_account(), snapshot(), trades_today=0, day_pnl=dec(0)
+    )
+    assert result.raw_response == '{"action": "hold", "reasoning": "verbatim"}'
+
+
+def test_openrouter_requires_a_key():
+    import pytest
+
+    from t212bot.ai_advisor import ProviderError
+
+    with pytest.raises(ProviderError, match="OPENROUTER_API_KEY"):
+        OpenRouterProvider(api_key="", model="openrouter/free")

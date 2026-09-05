@@ -1,0 +1,42 @@
+[Unit]
+Description=t212-bot trading service
+Documentation=file://__APP_DIR__/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=__APP_DIR__
+ExecStart=__APP_DIR__/.venv/bin/python -m t212bot.main
+
+# Restart on a crash, but slowly. The circuit breaker and the unresolved-order
+# guard both live in SQLite, so a restart does NOT clear either of them — a
+# restarted process re-reads the halt and refuses to trade until you clear it.
+Restart=on-failure
+RestartSec=60
+
+# A clean stop between cycles. The scheduler handles SIGTERM.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=t212-bot
+
+# Hardening. The service needs the network, its own directory, and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__APP_DIR__/data
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,136 @@
+# t212-bot configuration. Copy to config.yaml and edit.
+# Secrets live in .env, never here. This file is safe to commit if you want;
+# .gitignore excludes config.yaml by default in case you put account notes in it.
+
+capital:
+  # Hard ceiling on total capital under management, in GBP.
+  # No buy may leave (cash spent + position value) above this.
+  max_capital_gbp: 50.00
+
+  # No single position may exceed this % of max_capital_gbp.
+  per_trade_cap_pct: 25.0
+
+  # No single ticker's total holding may exceed this % of max_capital_gbp.
+  # (per_trade_cap_pct limits one order; this limits the accumulated position.)
+  max_position_pct: 25.0
+
+  # Orders smaller than this are rejected rather than shrunk to dust.
+  min_order_gbp: 1.00
+
+  # Cash never spent, so a fill that slips slightly cannot overdraw the account.
+  cash_buffer_gbp: 0.50
+
+risk:
+  # Circuit breaker: if today's total P&L (realised + unrealised) drops below
+  # -(this % of max_capital_gbp), trading halts and stays halted until you run
+  #   python -m t212bot.main --reset-breaker
+  daily_loss_limit_pct: 10.0
+
+  # Maximum orders placed per calendar day (Europe/London).
+  max_trades_per_day: 5
+
+  # Reject an AI proposal whose implied price differs from the last quote by
+  # more than this %. Guards against stale/hallucinated prices.
+  max_price_deviation_pct: 2.0
+
+  # Quotes older than this are treated as missing, and no order is approved.
+  max_quote_age_seconds: 900
+
+  # Proposals below this confidence are downgraded to hold.
+  min_confidence: 0.60
+
+execution:
+  # market | limit. Limit orders are placed at the quote adjusted by
+  # limit_offset_bps in the direction that helps you get filled.
+  order_type: market
+  limit_offset_bps: 25
+
+  # Assumed adverse slippage when simulating a fill in paper mode.
+  paper_slippage_bps: 10
+
+  # Order quantities are rounded DOWN to this many decimal places, so rounding
+  # can only ever shrink an order. Set fractional: false for whole shares only.
+  quantity_decimals: 6
+  fractional: true
+
+  # Abandon a cycle if the account/quote data used by the risk check is older
+  # than this by the time we are ready to submit.
+  max_decision_age_seconds: 120
+
+schedule:
+  # Standard 5-field cron. Local time in the timezone below.
+  cron: "0,30 8-16 * * mon-fri"
+  timezone: Europe/London
+
+  # Skip cycles outside these local times (belt and braces with the cron above).
+  market_open: "08:05"
+  market_close: "16:25"
+  trading_days: [mon, tue, wed, thu, fri]
+
+kill_switch:
+  # If this file exists at the start of a cycle, the cycle halts cleanly.
+  # `touch STOP` to stop the bot without stopping the service.
+  stop_file: ./STOP
+
+ai:
+  # auto | openrouter | anthropic | stub
+  #   auto — anthropic if ANTHROPIC_API_KEY is set, else openrouter.
+  #   stub — deterministic "hold", for testing the pipeline with no API calls.
+  provider: auto
+  timeout_seconds: 60
+  max_tokens: 1024
+
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    # openrouter/free auto-routes to a free model that fits the request, so it
+    # does not go stale when a specific free model is retired.
+    model: openrouter/free
+
+  anthropic:
+    model: claude-haiku-4-5
+
+  # Days of daily closes shown to the model for each watch-list ticker.
+  history_days: 30
+
+market_data:
+  # yahoo — free, no key. Uses the `yahoo` symbol from each watchlist entry.
+  provider: yahoo
+  timeout_seconds: 20
+  # Cache quotes for this long so a retry inside one cycle does not refetch.
+  cache_seconds: 60
+
+storage:
+  db_path: ./data/t212bot.sqlite3
+
+logging:
+  level: INFO
+  file: ./data/t212bot.log
+
+dashboard:
+  host: 0.0.0.0
+  port: 8080
+
+# ---------------------------------------------------------------------------
+# The allow-list. The AI can ONLY act on tickers listed here; anything else is
+# rejected by risk_manager before it reaches the broker.
+#
+#   ticker — the EXACT Trading212 instrument ticker. Find it with:
+#              python -m scripts.list_instruments VUSA
+#            Do not guess; T212 tickers are not plain exchange symbols.
+#   yahoo  — the Yahoo Finance symbol used for quotes and price history.
+#   name   — human label, shown to the AI and in the dashboard.
+#   max_position_pct — optional per-ticker override of capital.max_position_pct.
+# ---------------------------------------------------------------------------
+watchlist:
+  - ticker: VUSAl_EQ
+    yahoo: VUSA.L
+    name: Vanguard S&P 500 UCITS ETF (GBP)
+
+  - ticker: VWRPl_EQ
+    yahoo: VWRP.L
+    name: Vanguard FTSE All-World Acc (GBP)
+
+  - ticker: ISFl_EQ
+    yahoo: ISF.L
+    name: iShares Core FTSE 100 UCITS ETF (GBP)
+    max_position_pct: 20.0

@@ -1,0 +1,11 @@
+# Core runtime deps. Python 3.11+
+httpx>=0.27,<0.29
+PyYAML>=6.0
+python-dotenv>=1.0
+APScheduler>=3.10,<4
+Flask>=3.0            # dashboard.py only
+
+# Optional AI provider. OpenRouter needs no extra package (plain HTTP via httpx).
+# Install this only if you want to use the Anthropic API provider:
+#   pip install "anthropic>=1.0,<2"
+# anthropic 1.x is built on httpx2, which installs alongside httpx without conflict.

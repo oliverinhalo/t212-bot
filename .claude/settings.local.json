@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip index *)",
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(.venv/bin/python -m pytest)",
+      "Bash(.venv/bin/python -m pytest --durations=8)",
+      "Bash(.venv/bin/python -m pytest --durations=5)",
+      "Bash(chmod +x deploy/install.sh)",
+      "Bash(python3 -)",
+      "Bash(.venv/bin/python -m t212bot.main --dry-run --force)",
+      "Bash(.venv/bin/python -m pyflakes t212bot/ tests/ scripts/)",
+      "Bash(bash -n deploy/install.sh)"
+    ]
+  }
+}
