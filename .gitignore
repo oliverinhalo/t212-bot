@@ -1,6 +1,7 @@
 # Secrets — never commit
 .env
 *.pem
+.claude/settings.local.json
 
 # Local runtime state
 config.yaml
