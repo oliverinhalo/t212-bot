@@ -262,7 +262,12 @@ class OpenRouterProvider:
             message = choices[0].get("message") or {}
             content = message.get("content") or message.get("reasoning")
             if not content:
-                raise ProviderError("empty message")
+                raise ProviderError(
+                    f"{self._error_label} returned an empty message. "
+                    f"model={payload.get('model')!r}, "
+                    f"message={message!r}, "
+                    f"usage={payload.get('usage')!r}"
+                )
             return content
 
         raise ProviderError("structured-output retry exhausted")
