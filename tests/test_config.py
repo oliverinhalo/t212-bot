@@ -42,6 +42,8 @@ def clean_env(monkeypatch):
         "T212_API_SECRET",
         "T212_AUTH_SCHEME",
         "OPENROUTER_API_KEY",
+        "OMNIROUTE_API_KEY",
+        "OMNIROUTE_BASE_URL",
         "ANTHROPIC_API_KEY",
     ):
         monkeypatch.delenv(var, raising=False)
@@ -113,13 +115,19 @@ def test_non_paper_mode_requires_credentials(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_auto_prefers_anthropic_when_its_key_is_set():
-    secrets = Secrets(anthropic_api_key="a", openrouter_api_key="o")
-    assert resolve_provider("auto", secrets) == "anthropic"
+def test_auto_prefers_omniroute_when_its_key_is_set():
+    secrets = Secrets(omniroute_api_key="m", anthropic_api_key="a", openrouter_api_key="o")
+    assert resolve_provider("auto", secrets) == "omniroute"
 
 
-def test_auto_falls_back_to_openrouter():
+def test_auto_falls_back_to_anthropic_then_openrouter():
+    assert resolve_provider("auto", Secrets(anthropic_api_key="a", openrouter_api_key="o")) == "anthropic"
     assert resolve_provider("auto", Secrets(openrouter_api_key="o")) == "openrouter"
+
+
+def test_pinning_omniroute_without_its_key_is_an_error():
+    with pytest.raises(ConfigError, match="OMNIROUTE_API_KEY"):
+        resolve_provider("omniroute", Secrets())
 
 
 def test_auto_with_no_keys_is_an_error():
@@ -231,3 +239,96 @@ def test_config_repr_does_not_leak_secrets(tmp_path, monkeypatch):
     text = MINIMAL.replace("provider: stub", "provider: openrouter")
     config = load(write_config(tmp_path, text), env_file=None)
     assert "sk-or-secret-value" not in repr(config)
+
+
+# --------------------------------------------------------------------------- #
+# Open-universe toggle
+# --------------------------------------------------------------------------- #
+
+
+def test_enforce_allowlist_defaults_to_true(tmp_path):
+    config = load(write_config(tmp_path), env_file=None)
+    assert config.risk.enforce_allowlist is True
+
+
+def _open_universe_config(tmp_path) -> str:
+    return MINIMAL.replace(
+        "  max_trades_per_day: 5",
+        "  max_trades_per_day: 5\n  enforce_allowlist: false",
+    ).replace(
+        "ai:\n  provider: stub",
+        f"ai:\n  provider: stub\nstorage:\n  db_path: {tmp_path / 'data' / 't.sqlite3'}",
+    )
+
+
+def test_disabling_the_allowlist_needs_the_instrument_catalogue(tmp_path):
+    (tmp_path / "data").mkdir()
+    with pytest.raises(ConfigError, match="instrument catalogue"):
+        load(write_config(tmp_path, _open_universe_config(tmp_path)), env_file=None)
+
+
+def test_disabling_the_allowlist_works_when_the_catalogue_is_present(tmp_path):
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "instruments.json").write_text("[]")
+    config = load(write_config(tmp_path, _open_universe_config(tmp_path)), env_file=None)
+    assert config.risk.enforce_allowlist is False
+    assert config.instruments_path == tmp_path / "data" / "instruments.json"
+
+
+# --------------------------------------------------------------------------- #
+# OmniRoute provider
+# --------------------------------------------------------------------------- #
+
+
+def test_omniroute_provider_needs_a_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "k")
+    text = MINIMAL.replace(
+        "ai:\n  provider: stub",
+        "ai:\n  provider: omniroute\n  omniroute:\n    base_url: http://127.0.0.1:20128/v1",
+    )
+    with pytest.raises(ConfigError, match="ai.omniroute.model"):
+        load(write_config(tmp_path, text), env_file=None)
+
+
+def test_omniroute_provider_needs_a_base_url(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "k")
+    text = MINIMAL.replace(
+        "ai:\n  provider: stub",
+        "ai:\n  provider: omniroute\n  omniroute:\n    model: default",
+    )
+    with pytest.raises(ConfigError, match="ai.omniroute.base_url"):
+        load(write_config(tmp_path, text), env_file=None)
+
+
+def test_omniroute_provider_loads_with_model_and_base_url(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "k")
+    text = MINIMAL.replace(
+        "ai:\n  provider: stub",
+        "ai:\n  provider: omniroute\n  omniroute:\n    base_url: http://127.0.0.1:20128/v1\n"
+        "    model: default",
+    )
+    config = load(write_config(tmp_path, text), env_file=None)
+    assert config.ai.provider == "omniroute"
+    assert config.ai.omniroute_base_url == "http://127.0.0.1:20128/v1"
+    assert config.ai.omniroute_models == ("default",)
+
+
+def test_omniroute_base_url_env_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "k")
+    monkeypatch.setenv("OMNIROUTE_BASE_URL", "https://omni.jacoblevy.co.uk/v1")
+    text = MINIMAL.replace(
+        "ai:\n  provider: stub",
+        "ai:\n  provider: omniroute\n  omniroute:\n    base_url: http://127.0.0.1:20128/v1\n"
+        "    model: default",
+    )
+    config = load(write_config(tmp_path, text), env_file=None)
+    assert config.ai.omniroute_base_url == "https://omni.jacoblevy.co.uk/v1"
+
+
+def test_symbol_overrides_are_parsed(tmp_path):
+    text = MINIMAL.replace(
+        "watchlist:",
+        "market_data:\n  symbol_overrides:\n    AAPL_US_EQ: AAPL\nwatchlist:",
+    )
+    config = load(write_config(tmp_path, text), env_file=None)
+    assert config.symbol_overrides["AAPL_US_EQ"] == "AAPL"

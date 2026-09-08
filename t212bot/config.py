@@ -65,6 +65,10 @@ class RiskConfig:
     max_price_deviation_pct: Decimal
     max_quote_age_seconds: int
     min_confidence: Decimal
+    # When True the AI may only act on watch-list tickers. When False it may
+    # name any Trading212 instrument (resolved against data/instruments.json and
+    # priced in GBP on demand); an unknown ticker is still rejected.
+    enforce_allowlist: bool = True
 
     def daily_loss_limit(self, max_capital: Decimal) -> Decimal:
         """The P&L level (negative) at or below which trading halts."""
@@ -91,6 +95,33 @@ class ScheduleConfig:
 
 
 @dataclass(frozen=True)
+class IndicatorConfig:
+    """Windows for the local technical analysis. Bars are daily closes."""
+
+    sma_short: int = 10
+    sma_mid: int = 20
+    sma_long: int = 50
+    rsi_period: int = 14
+    min_bars: int = 30
+    lookback_days: int = 60
+
+    @property
+    def bars_needed(self) -> int:
+        return max(self.sma_long, self.rsi_period + 1, self.min_bars)
+
+
+@dataclass(frozen=True)
+class LocalStrategyConfig:
+    """The deterministic fallback advisor's thresholds, all in percent."""
+
+    stop_loss_pct: Decimal = Decimal(8)
+    trend_exit: bool = True
+    take_profit_pct: Decimal = Decimal(15)
+    max_entry_vol_pct: Decimal = Decimal(35)
+    min_entry_score: Decimal = Decimal("0.35")
+
+
+@dataclass(frozen=True)
 class AIConfig:
     provider: str
     timeout_seconds: int
@@ -99,6 +130,30 @@ class AIConfig:
     openrouter_model: str
     anthropic_model: str
     history_days: int
+    # Fallback chain of OpenRouter model slugs, tried in order until one
+    # answers. The single ``openrouter_model`` above is kept for compatibility
+    # and is always the first entry unless a list is given.
+    openrouter_models: tuple[str, ...] = ("openrouter/free",)
+    # OmniRoute: a self-hosted/private OpenAI-compatible router, same wire
+    # format as OpenRouter. base_url is required when ai.provider is
+    # "omniroute" (e.g. http://127.0.0.1:20128/v1 or https://omni.example/v1).
+    omniroute_base_url: str = ""
+    omniroute_model: str = ""
+    omniroute_models: tuple[str, ...] = ()
+    # Stop calling OpenRouter once this many HTTP calls have been made today
+    # (UTC). The free tier is ~50/day; 45 leaves headroom. Past this the local
+    # strategy takes over.
+    daily_request_budget: int = 45
+    # When the LLM fails or the budget is spent, fall back to the local
+    # rule-based advisor rather than degrading straight to "hold".
+    local_fallback: bool = True
+    # Skip the LLM call entirely when nothing material changed since the last
+    # cycle and that cycle held.
+    skip_when_unchanged: bool = True
+    # A price move smaller than this (percent) does not count as "material".
+    min_price_move_pct: Decimal = Decimal("0.5")
+    indicators: IndicatorConfig = field(default_factory=IndicatorConfig)
+    local_strategy: LocalStrategyConfig = field(default_factory=LocalStrategyConfig)
 
 
 @dataclass(frozen=True)
@@ -106,6 +161,11 @@ class MarketDataConfig:
     provider: str
     timeout_seconds: int
     cache_seconds: int
+    # Cache lifetime for a fetched GBP FX rate (open-universe mode only).
+    fx_cache_seconds: int = 900
+    # Allow the Yahoo ISIN search when resolving a symbol for an off-list
+    # instrument. Turn off to rely solely on overrides + the derived symbol.
+    symbol_search: bool = True
 
 
 @dataclass(frozen=True)
@@ -132,6 +192,7 @@ class Secrets:
     t212_api_key: str = ""
     t212_api_secret: str = ""
     openrouter_api_key: str = ""
+    omniroute_api_key: str = ""
     anthropic_api_key: str = ""
 
     def __repr__(self) -> str:  # pragma: no cover - defensive
@@ -155,10 +216,25 @@ class AppConfig:
     t212_base_url: str
     t212_auth_scheme: str
     secrets: Secrets = field(default=Secrets(), repr=False)
+    # T212 ticker or ISIN -> Yahoo Finance symbol, to pin symbol resolution for
+    # instruments where the automatic lookup is wrong or ambiguous.
+    symbol_overrides: Mapping[str, str] = field(default_factory=dict)
+    instruments_path: Path = Path("data/instruments.json")
 
     @property
     def is_live(self) -> bool:
         return self.mode == "live"
+
+    @property
+    def max_history_days(self) -> int:
+        """Calendar days of history to request.
+
+        Yahoo's ``range`` is in calendar days but only trading days come back
+        (~5 in 7), so the trading-bar requirement is inflated to leave enough
+        for the long SMA plus a margin.
+        """
+        bars = max(self.ai.history_days, self.ai.indicators.bars_needed)
+        return int(bars * 1.5) + 15
 
     @property
     def places_real_orders(self) -> bool:
@@ -278,6 +354,7 @@ def _load_secrets() -> Secrets:
         t212_api_key=os.getenv("T212_API_KEY", "").strip(),
         t212_api_secret=os.getenv("T212_API_SECRET", "").strip(),
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
+        omniroute_api_key=os.getenv("OMNIROUTE_API_KEY", "").strip(),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),
     )
 
@@ -306,23 +383,33 @@ def resolve_mode() -> str:
 def resolve_provider(configured: str, secrets: Secrets) -> str:
     """Pick the AI provider, honouring 'auto'."""
     provider = (configured or "auto").strip().lower()
-    if provider not in ("auto", "openrouter", "anthropic", "stub"):
-        raise ConfigError(f"ai.provider must be auto|openrouter|anthropic|stub (got {provider!r})")
+    if provider not in ("auto", "openrouter", "omniroute", "anthropic", "stub"):
+        raise ConfigError(
+            f"ai.provider must be auto|openrouter|omniroute|anthropic|stub (got {provider!r})"
+        )
 
     if provider == "auto":
+        # OmniRoute first: self-hosted and unmetered, so it is not subject to
+        # the OpenRouter free-tier daily budget — the better choice whenever
+        # the bot needs to call the model on every cycle.
+        if secrets.omniroute_api_key:
+            return "omniroute"
         if secrets.anthropic_api_key:
             return "anthropic"
         if secrets.openrouter_api_key:
             return "openrouter"
         raise ConfigError(
-            "ai.provider is 'auto' but neither ANTHROPIC_API_KEY nor OPENROUTER_API_KEY is set. "
-            "Set one in .env, or set ai.provider: stub to run the pipeline without an LLM."
+            "ai.provider is 'auto' but none of ANTHROPIC_API_KEY, OPENROUTER_API_KEY, or "
+            "OMNIROUTE_API_KEY is set. Set one in .env, or set ai.provider: stub to run the "
+            "pipeline without an LLM."
         )
 
     if provider == "anthropic" and not secrets.anthropic_api_key:
         raise ConfigError("ai.provider is 'anthropic' but ANTHROPIC_API_KEY is not set")
     if provider == "openrouter" and not secrets.openrouter_api_key:
         raise ConfigError("ai.provider is 'openrouter' but OPENROUTER_API_KEY is not set")
+    if provider == "omniroute" and not secrets.omniroute_api_key:
+        raise ConfigError("ai.provider is 'omniroute' but OMNIROUTE_API_KEY is not set")
     return provider
 
 
@@ -379,6 +466,7 @@ def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env"
         ),
         max_quote_age_seconds=_int(risk_raw, "max_quote_age_seconds", "risk", 900),
         min_confidence=_dec(risk_raw, "min_confidence", "risk", "0.6"),
+        enforce_allowlist=bool(risk_raw.get("enforce_allowlist", True)),
     )
     if not (Decimal(0) <= risk.min_confidence <= Decimal(1)):
         raise ConfigError("risk.min_confidence must be between 0 and 1")
@@ -417,7 +505,60 @@ def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env"
 
     ai_raw = _section(data, "ai")
     openrouter_raw = _section(ai_raw, "openrouter")
+    omniroute_raw = _section(ai_raw, "omniroute")
     anthropic_raw = _section(ai_raw, "anthropic")
+    ind_raw = _section(ai_raw, "indicators")
+    strat_raw = _section(ai_raw, "local_strategy")
+
+    openrouter_model = str(openrouter_raw.get("model", "openrouter/free"))
+    models_raw = openrouter_raw.get("models")
+    if models_raw is None:
+        openrouter_models: tuple[str, ...] = (openrouter_model,)
+    elif isinstance(models_raw, list) and models_raw:
+        openrouter_models = tuple(str(m).strip() for m in models_raw if str(m).strip())
+    else:
+        raise ConfigError("ai.openrouter.models must be a non-empty list of model slugs")
+    if not openrouter_models:
+        raise ConfigError("ai.openrouter.models resolved to an empty list")
+
+    omniroute_model = str(omniroute_raw.get("model", "")).strip()
+    omniroute_models_raw = omniroute_raw.get("models")
+    if omniroute_models_raw is None:
+        omniroute_models: tuple[str, ...] = (omniroute_model,) if omniroute_model else ()
+    elif isinstance(omniroute_models_raw, list) and omniroute_models_raw:
+        omniroute_models = tuple(str(m).strip() for m in omniroute_models_raw if str(m).strip())
+    else:
+        raise ConfigError("ai.omniroute.models must be a non-empty list of model slugs")
+
+    indicators = IndicatorConfig(
+        sma_short=_int(ind_raw, "sma_short", "ai.indicators", 10),
+        sma_mid=_int(ind_raw, "sma_mid", "ai.indicators", 20),
+        sma_long=_int(ind_raw, "sma_long", "ai.indicators", 50),
+        rsi_period=_int(ind_raw, "rsi_period", "ai.indicators", 14),
+        min_bars=_int(ind_raw, "min_bars", "ai.indicators", 30),
+        lookback_days=_int(ind_raw, "lookback_days", "ai.indicators", 60),
+    )
+    if not (0 < indicators.sma_short < indicators.sma_mid < indicators.sma_long):
+        raise ConfigError(
+            "ai.indicators SMA windows must be increasing and positive "
+            f"(got {indicators.sma_short}/{indicators.sma_mid}/{indicators.sma_long})"
+        )
+    if indicators.rsi_period < 2:
+        raise ConfigError("ai.indicators.rsi_period must be at least 2")
+
+    local_strategy = LocalStrategyConfig(
+        stop_loss_pct=_pct(_dec(strat_raw, "stop_loss_pct", "ai.local_strategy", 8),
+                           "ai.local_strategy.stop_loss_pct"),
+        trend_exit=bool(strat_raw.get("trend_exit", True)),
+        take_profit_pct=_pct(_dec(strat_raw, "take_profit_pct", "ai.local_strategy", 15),
+                             "ai.local_strategy.take_profit_pct", upper=Decimal(1000)),
+        max_entry_vol_pct=_pct(_dec(strat_raw, "max_entry_vol_pct", "ai.local_strategy", 35),
+                               "ai.local_strategy.max_entry_vol_pct", upper=Decimal(1000)),
+        min_entry_score=_dec(strat_raw, "min_entry_score", "ai.local_strategy", "0.35"),
+    )
+    if not (Decimal(0) < local_strategy.min_entry_score <= Decimal(1)):
+        raise ConfigError("ai.local_strategy.min_entry_score must be in (0, 1]")
+
     ai = AIConfig(
         provider=resolve_provider(str(ai_raw.get("provider", "auto")), secrets),
         timeout_seconds=_int(ai_raw, "timeout_seconds", "ai", 60),
@@ -425,20 +566,60 @@ def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env"
         openrouter_base_url=str(
             openrouter_raw.get("base_url", "https://openrouter.ai/api/v1")
         ).rstrip("/"),
-        openrouter_model=str(openrouter_raw.get("model", "openrouter/free")),
+        openrouter_model=openrouter_model,
         anthropic_model=str(anthropic_raw.get("model", "claude-haiku-4-5")),
         history_days=_int(ai_raw, "history_days", "ai", 30),
+        openrouter_models=openrouter_models,
+        omniroute_base_url=os.getenv(
+            "OMNIROUTE_BASE_URL", str(omniroute_raw.get("base_url", ""))
+        ).rstrip("/"),
+        omniroute_model=omniroute_model,
+        omniroute_models=omniroute_models,
+        daily_request_budget=_int(ai_raw, "daily_request_budget", "ai", 45),
+        local_fallback=bool(ai_raw.get("local_fallback", True)),
+        skip_when_unchanged=bool(ai_raw.get("skip_when_unchanged", True)),
+        min_price_move_pct=_dec(ai_raw, "min_price_move_pct", "ai", "0.5"),
+        indicators=indicators,
+        local_strategy=local_strategy,
     )
+    if ai.daily_request_budget < 0:
+        raise ConfigError("ai.daily_request_budget must not be negative")
+    if ai.min_price_move_pct < 0:
+        raise ConfigError("ai.min_price_move_pct must not be negative")
+    if ai.provider == "omniroute":
+        if not ai.omniroute_models:
+            raise ConfigError(
+                "ai.provider is 'omniroute' but ai.omniroute.model (or .models) is not set"
+            )
+        if not ai.omniroute_base_url:
+            raise ConfigError("ai.provider is 'omniroute' but ai.omniroute.base_url is not set")
 
     md_raw = _section(data, "market_data")
     market_data = MarketDataConfig(
         provider=str(md_raw.get("provider", "yahoo")).strip().lower(),
         timeout_seconds=_int(md_raw, "timeout_seconds", "market_data", 20),
         cache_seconds=_int(md_raw, "cache_seconds", "market_data", 60),
+        fx_cache_seconds=_int(md_raw, "fx_cache_seconds", "market_data", 900),
+        symbol_search=bool(md_raw.get("symbol_search", True)),
     )
+
+    overrides_raw = md_raw.get("symbol_overrides") or {}
+    if not isinstance(overrides_raw, Mapping):
+        raise ConfigError("market_data.symbol_overrides must be a mapping")
+    symbol_overrides = {str(k).strip(): str(v).strip() for k, v in overrides_raw.items()}
 
     store_raw = _section(data, "storage")
     storage = StorageConfig(db_path=Path(str(store_raw.get("db_path", "./data/t212bot.sqlite3"))))
+    instruments_path = Path(
+        str(store_raw.get("instruments_path", storage.db_path.parent / "instruments.json"))
+    )
+
+    if not risk.enforce_allowlist and not instruments_path.exists():
+        raise ConfigError(
+            "risk.enforce_allowlist is false but the instrument catalogue "
+            f"{instruments_path} is missing. Run it once:\n"
+            "  python -m scripts.list_instruments --refresh"
+        )
 
     log_raw = _section(data, "logging")
     log_file = log_raw.get("file")
@@ -484,4 +665,6 @@ def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env"
         t212_base_url=base_url,
         t212_auth_scheme=auth_scheme,
         secrets=secrets,
+        symbol_overrides=symbol_overrides,
+        instruments_path=instruments_path,
     )

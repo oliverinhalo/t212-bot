@@ -4,10 +4,10 @@ The advisor's output is a *proposal*, never an instruction. It is parsed
 defensively, clamped to the allow-list by risk_manager, and can only ever be
 shrunk from here. Anything unparseable becomes a ``hold``.
 
-Providers are behind one small interface, so switching between OpenRouter and
-the Anthropic API is a config change (``ai.provider``) rather than a code
-change. Both are given the same prompt and both return raw text, which is
-stored verbatim in the audit log.
+Providers are behind one small interface, so switching between OpenRouter,
+OmniRoute and the Anthropic API is a config change (``ai.provider``) rather
+than a code change. All are given the same prompt and all return raw text,
+which is stored verbatim in the audit log.
 """
 
 from __future__ import annotations
@@ -17,11 +17,12 @@ import logging
 import re
 import time
 from decimal import Decimal
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, Sequence
 
 import httpx
 
 from .config import AppConfig
+from .indicators import TechnicalSignals, summary_lines
 from .market_data import Snapshot
 from .models import (
     ZERO,
@@ -37,19 +38,32 @@ log = logging.getLogger(__name__)
 MAX_REASONING_CHARS = 600
 
 SYSTEM_PROMPT = """\
-You are the analyst for a very small, low-frequency stock/ETF bot. Total capital \
-under management is tiny, and capital preservation matters more than returns.
+You are the analyst for a small, active, short-term stock/ETF bot. It trades \
+frequently in small size: capital preservation matters, but so does actually \
+trading — each position is tiny, so the cost of being wrong on any one cycle is \
+small, and sitting in "hold" every cycle when the data supports a trade wastes \
+the whole point of running this often.
 
 Rules you must follow:
 1. You may only ever name a ticker from the ALLOW-LIST given in the message. \
 Never invent, substitute, or guess a ticker.
 2. You may recommend exactly one action per cycle: buy, sell, or hold.
-3. "hold" is the correct answer most of the time. Only propose a trade when \
-there is a concrete reason in the data you were given.
-4. Never propose more than the stated per-trade cap, and never propose selling \
-more than is actually held.
+3. This is a short-term, high-turnover strategy: propose a buy or sell whenever \
+the technical signals reasonably support one, even a modest one. Do not default \
+to "hold" out of caution alone — only hold when the data is genuinely mixed or \
+gives no lean either way.
+4. Every buy or sell should be sized within the LIMITS given in the message — \
+between the stated minimum order and the stated per-trade cap. Never propose \
+more than the per-trade cap, never propose below the minimum order, and never \
+propose selling more than is actually held.
 5. You cannot short, use leverage, or trade anything other than the listed \
 instruments. Do not suggest them.
+6. A TECHNICAL SIGNALS block and a MARKET REGIME line may be provided. They are \
+deterministic, computed locally from daily closes. Treat them as real input to \
+your decision, not decoration: a "bullish" tag with a decent score is a \
+legitimate reason to buy small, and a "bearish" tag on something you hold is a \
+legitimate reason to trim or exit. In a "defensive" regime, size and lean \
+smaller rather than skipping the cycle entirely.
 
 Reply with a single JSON object and nothing else. No prose, no markdown fences.
 
@@ -67,6 +81,28 @@ Reply with a single JSON object and nothing else. No prose, no markdown fences.
 to spend or raise, "shares" means a number of shares. Prefer "gbp" for buys.
 A proposal that breaks any rule above is discarded by a separate risk system, \
 and a discarded proposal is a wasted cycle."""
+
+
+# Open-universe variant: the AI may name any Trading212 instrument, not just the
+# watch-list. Rule 1 and 5 change; everything else is identical.
+SYSTEM_PROMPT_OPEN = SYSTEM_PROMPT.replace(
+    "1. You may only ever name a ticker from the ALLOW-LIST given in the message. "
+    "Never invent, substitute, or guess a ticker.",
+    "1. You may name any stock or ETF that trades on Trading212. Give its exact "
+    "Trading212 ticker when you know it (e.g. AAPL_US_EQ, NVDA_US_EQ, SAPd_EQ); "
+    "otherwise give a plain company name or symbol (e.g. \"Apple\", \"NVDA\") and "
+    "it will be resolved. Never invent a ticker format. If a name cannot be "
+    "resolved to a real instrument the proposal is discarded.",
+).replace(
+    "5. You cannot short, use leverage, or trade anything other than the listed "
+    "instruments. Do not suggest them.",
+    "5. You cannot short, use leverage, or trade options/derivatives. Cash equity "
+    "and ETFs only. Foreign-currency instruments are converted to GBP for every "
+    "limit, so size in GBP.",
+).replace(
+    '"ticker": "<exact ticker from the allow-list, or null when holding>"',
+    '"ticker": "<Trading212 ticker or a resolvable name/symbol, or null when holding>"',
+)
 
 
 class ProviderError(Exception):
@@ -113,28 +149,48 @@ class StubProvider:
 class OpenRouterProvider:
     """OpenAI-compatible chat completions against OpenRouter.
 
-    ``openrouter/free`` auto-routes to a free model that fits the request, so
-    the config does not go stale when a specific free model is retired.
+    Given a chain of model slugs, each is tried in order until one answers, so a
+    single free model being rate-limited or retired does not lose the cycle.
+    ``openrouter/free`` auto-routes to whatever free model fits and is the
+    natural last entry in the chain.
+
+    ``last_http_calls`` records how many HTTP requests the most recent
+    ``complete`` made — the bot meters this against the free-tier daily cap.
+    ``last_model`` is the slug that actually answered, for the audit log.
+
+    Also the base class for other OpenAI-compatible chat-completions backends
+    (see ``OmniRouteProvider``) — the wire format is identical, only the key,
+    default host and error labels differ.
     """
 
     name = "openrouter"
+    _key_env_var = "OPENROUTER_API_KEY"
+    _error_label = "OpenRouter"
 
     def __init__(
         self,
         api_key: str,
-        model: str,
+        model: str | None = None,
         base_url: str = "https://openrouter.ai/api/v1",
         max_tokens: int = 1024,
         timeout: float = 60.0,
         app_url: str = "",
         app_title: str = "t212-bot",
         client: httpx.Client | None = None,
+        models: "Sequence[str] | None" = None,
     ):
         if not api_key:
-            raise ProviderError("OPENROUTER_API_KEY is not set")
-        self.model = model
+            raise ProviderError(f"{self._key_env_var} is not set")
+        chain = list(models) if models else ([model] if model else ["openrouter/free"])
+        self.models = [m.strip() for m in chain if m and m.strip()]
+        if not self.models:
+            raise ProviderError(f"{self._error_label} needs at least one model slug")
+        self.model = self.models[0]
+        self.last_model = self.models[0]
+        self.last_http_calls = 0
         self._base_url = base_url.rstrip("/")
         self._max_tokens = max_tokens
+        self._no_json_mode: set[str] = set()
         self._headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -151,8 +207,21 @@ class OpenRouterProvider:
             self._http.close()
 
     def complete(self, system: str, user: str) -> str:
-        body = {
-            "model": self.model,
+        self.last_http_calls = 0
+        errors: list[str] = []
+        for model in self.models:
+            try:
+                content = self._complete_one(model, system, user)
+                self.last_model = model
+                return content
+            except ProviderError as exc:
+                errors.append(f"{model}: {exc}")
+                log.warning("%s model %s unavailable: %s", self._error_label, model, exc)
+        raise ProviderError(f"every {self._error_label} model failed — " + " | ".join(errors))
+
+    def _complete_one(self, model: str, system: str, user: str) -> str:
+        body: dict[str, Any] = {
+            "model": model,
             "max_tokens": self._max_tokens,
             "temperature": 0.2,
             "messages": [
@@ -160,28 +229,79 @@ class OpenRouterProvider:
                 {"role": "user", "content": user},
             ],
         }
-        # Free auto-routed models do not reliably support response_format, so
-        # the JSON contract is enforced by the prompt plus _extract_json below.
-        try:
-            response = self._http.post(
-                f"{self._base_url}/chat/completions", headers=self._headers, json=body
-            )
-        except httpx.HTTPError as exc:
-            raise ProviderError(f"OpenRouter request failed: {exc}") from exc
+        want_json = model not in self._no_json_mode
+        if want_json:
+            body["response_format"] = {"type": "json_object"}
 
-        if response.status_code == 429:
-            raise ProviderError("OpenRouter rate limit reached (free tier is ~20/min, 50/day)")
-        if response.status_code >= 400:
-            raise ProviderError(f"OpenRouter HTTP {response.status_code}: {response.text[:300]}")
+        for _ in range(2):
+            self.last_http_calls += 1
+            try:
+                response = self._http.post(
+                    f"{self._base_url}/chat/completions",
+                    headers=self._headers,
+                    json=body,
+                )
+            except httpx.HTTPError as exc:
+                raise ProviderError(f"request failed: {exc}") from exc
 
-        payload = response.json()
-        choices = payload.get("choices") or []
-        if not choices:
-            raise ProviderError(f"OpenRouter returned no choices: {str(payload)[:300]}")
-        content = (choices[0].get("message") or {}).get("content")
-        if not content:
-            raise ProviderError("OpenRouter returned an empty message")
-        return content
+            if response.status_code == 400 and "response_format" in body:
+                # This model rejects structured-output mode. Drop it, remember
+                # not to ask again, and retry once in plain-text mode.
+                self._no_json_mode.add(model)
+                body.pop("response_format", None)
+                continue
+            if response.status_code == 429:
+                raise ProviderError("rate limit (free tier is ~20/min, ~50/day)")
+            if response.status_code >= 400:
+                raise ProviderError(f"HTTP {response.status_code}: {response.text[:300]}")
+
+            payload = response.json()
+            choices = payload.get("choices") or []
+            if not choices:
+                raise ProviderError(f"no choices: {str(payload)[:200]}")
+            message = choices[0].get("message") or {}
+            content = message.get("content") or message.get("reasoning")
+            if not content:
+                raise ProviderError("empty message")
+            return content
+
+        raise ProviderError("structured-output retry exhausted")
+
+
+class OmniRouteProvider(OpenRouterProvider):
+    """An OmniRoute instance — a self-hosted or private OpenAI-compatible router.
+
+    Wire-compatible with OpenRouter's chat completions endpoint (same request
+    and response shape, same model-fallback-chain and JSON-mode-retry
+    behaviour), just pointed at your own instance instead of openrouter.ai —
+    e.g. ``http://127.0.0.1:20128/v1`` or ``https://omni.jacoblevy.co.uk/v1``.
+    """
+
+    name = "omniroute"
+    _key_env_var = "OMNIROUTE_API_KEY"
+    _error_label = "OmniRoute"
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str | None = None,
+        base_url: str = "",
+        max_tokens: int = 1024,
+        timeout: float = 60.0,
+        client: httpx.Client | None = None,
+        models: "Sequence[str] | None" = None,
+    ):
+        if not base_url:
+            raise ProviderError("OMNIROUTE_BASE_URL (ai.omniroute.base_url) is not set")
+        super().__init__(
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            client=client,
+            models=models,
+        )
 
 
 class AnthropicProvider:
@@ -253,12 +373,20 @@ def build_provider(config: AppConfig, *, app_url: str = "", app_title: str = "t2
     if config.ai.provider == "openrouter":
         return OpenRouterProvider(
             api_key=config.secrets.openrouter_api_key,
-            model=config.ai.openrouter_model,
+            models=config.ai.openrouter_models,
             base_url=config.ai.openrouter_base_url,
             max_tokens=config.ai.max_tokens,
             timeout=config.ai.timeout_seconds,
             app_url=app_url,
             app_title=app_title,
+        )
+    if config.ai.provider == "omniroute":
+        return OmniRouteProvider(
+            api_key=config.secrets.omniroute_api_key,
+            models=config.ai.omniroute_models,
+            base_url=config.ai.omniroute_base_url,
+            max_tokens=config.ai.max_tokens,
+            timeout=config.ai.timeout_seconds,
         )
     raise ProviderError(f"unknown ai.provider: {config.ai.provider!r}")
 
@@ -275,8 +403,17 @@ def build_prompt(
     *,
     trades_today: int,
     day_pnl: Decimal,
+    signals: Mapping[str, TechnicalSignals] | None = None,
+    regime: str = "",
+    open_universe: bool = False,
 ) -> str:
-    """Compact, deterministic prompt. Only allow-listed tickers ever appear."""
+    """Compact, deterministic prompt.
+
+    In allow-list mode only watch-list tickers appear. In open-universe mode the
+    watch-list is presented as the set with full local data, and the AI is told
+    it may name others.
+    """
+    signals = signals or {}
     lines: list[str] = []
 
     lines.append("ACCOUNT (GBP)")
@@ -312,7 +449,10 @@ def build_prompt(
         lines.append("  (none)")
     lines.append("")
 
-    lines.append("ALLOW-LIST — you may name no other ticker")
+    if open_universe:
+        lines.append("INSTRUMENTS WITH FULL LOCAL DATA (prefer these; you may also name others)")
+    else:
+        lines.append("ALLOW-LIST — you may name no other ticker")
     for item in config.watchlist:
         quote = snapshot.quotes.get(item.ticker)
         if quote is None:
@@ -328,7 +468,23 @@ def build_prompt(
         held = account.quantity_of(item.ticker)
         if held > ZERO:
             parts.append(f"held {held}")
+        sig = signals.get(item.ticker)
+        if sig is not None:
+            parts.append(f"trend {sig.trend} (score {sig.score:+.2f})")
         lines.append(f"  {item.ticker} ({item.name}): " + ", ".join(parts))
+
+    if open_universe:
+        lines.append(
+            "  You may also propose any other Trading212-listed stock or ETF by "
+            "ticker or name. Those have no local signals and are priced in GBP "
+            "on demand; prefer the instruments above unless you have a specific "
+            "reason to go elsewhere."
+        )
+
+    technical = summary_lines(signals, regime) if signals else []
+    if technical:
+        lines.append("")
+        lines.extend(technical)
 
     if snapshot.histories:
         lines.append("")
@@ -350,6 +506,7 @@ def build_prompt(
 # --------------------------------------------------------------------------- #
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+_THINK = re.compile(r"<(think|reasoning|thinking)>.*?</\1>", re.DOTALL | re.IGNORECASE)
 
 
 def _extract_json(raw: str) -> Mapping[str, Any]:
@@ -362,6 +519,12 @@ def _extract_json(raw: str) -> Mapping[str, Any]:
     text = (raw or "").strip()
     if not text:
         raise ValueError("empty response")
+
+    # Reasoning models emit a <think>…</think> trace before the answer, and it
+    # can contain braces that would derail the balanced-object scan below.
+    text = _THINK.sub("", text).strip()
+    if not text:
+        raise ValueError("response was only a reasoning trace")
 
     fenced = _FENCE.search(text)
     if fenced:
@@ -481,11 +644,23 @@ def advise(
     *,
     trades_today: int,
     day_pnl: Decimal,
-    system_prompt: str = SYSTEM_PROMPT,
+    signals: Mapping[str, TechnicalSignals] | None = None,
+    regime: str = "",
+    open_universe: bool = False,
+    system_prompt: str | None = None,
 ) -> AIResult:
     """Run one advisory call. A provider failure degrades to ``hold``, not a crash."""
+    if system_prompt is None:
+        system_prompt = SYSTEM_PROMPT_OPEN if open_universe else SYSTEM_PROMPT
     prompt = build_prompt(
-        config, account, snapshot, trades_today=trades_today, day_pnl=day_pnl
+        config,
+        account,
+        snapshot,
+        trades_today=trades_today,
+        day_pnl=day_pnl,
+        signals=signals,
+        regime=regime,
+        open_universe=open_universe,
     )
     started = time.monotonic()
 
@@ -507,20 +682,23 @@ def advise(
     return AIResult(
         proposal=proposal,
         provider=getattr(provider, "name", "unknown"),
-        model=getattr(provider, "model", "unknown"),
+        model=getattr(provider, "last_model", getattr(provider, "model", "unknown")),
         prompt=prompt,
         raw_response=raw,
         latency_ms=latency_ms,
         error=error,
+        http_calls=int(getattr(provider, "last_http_calls", 1)),
     )
 
 
 __all__ = [
     "SYSTEM_PROMPT",
+    "SYSTEM_PROMPT_OPEN",
     "Provider",
     "ProviderError",
     "StubProvider",
     "OpenRouterProvider",
+    "OmniRouteProvider",
     "AnthropicProvider",
     "build_provider",
     "build_prompt",

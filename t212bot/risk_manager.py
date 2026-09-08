@@ -440,15 +440,23 @@ def evaluate(proposal: Proposal, inputs: RiskInputs, config: AppConfig) -> Verdi
     if proposal.action not in ("buy", "sell"):
         return reject("R04_HOLD", f"unrecognised action {proposal.action!r}")
 
-    # 5. Allow-list. The AI cannot invent instruments.
+    # 5. Allow-list. The AI cannot invent instruments. In open-universe mode
+    #    inputs.allowed_tickers is the set main.py managed to price this cycle
+    #    (an unresolvable or hallucinated ticker never makes it in); otherwise
+    #    it is the configured watch-list.
     ticker = (proposal.ticker or "").strip()
     if not ticker:
         return reject("R05_ALLOWLIST", "proposal named no ticker")
-    if ticker not in config.allowed_tickers or True: # remove allow list ## warning
+    allowed = (
+        inputs.allowed_tickers
+        if inputs.allowed_tickers is not None
+        else config.allowed_tickers
+    )
+    if ticker not in allowed:
         return reject(
             "R05_ALLOWLIST",
-            f"{ticker} is not on the allow-list "
-            f"({', '.join(sorted(config.allowed_tickers))})",
+            f"{ticker} is not tradable this cycle "
+            f"({', '.join(sorted(allowed)) or 'nothing priced'})",
             ticker=ticker,
         )
 

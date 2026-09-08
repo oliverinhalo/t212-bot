@@ -7,10 +7,14 @@ from datetime import datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from t212bot.ai_advisor import StubProvider
 from t212bot.executor import Executor
+from t212bot.fx import FxConverter
+from t212bot.instruments import Instrument, InstrumentCatalogue
 from t212bot.main import Runtime, run_cycle, trading_day, within_trading_window
-from t212bot.market_data import StaticMarketData
+from t212bot.market_data import StaticMarketData, SymbolResolver
 from t212bot.models import dec
 
 from conftest import OTHER, TICKER, make_config
@@ -31,14 +35,48 @@ def make_runtime(storage, config=None, ai_response=None):
     )
 
 
-def buy_response(notional=10, ticker=TICKER, confidence=0.9) -> str:
+_UNIVERSE = [
+    Instrument("NVDA_US_EQ", "Nvidia", "NVDA", "US67066G1040", "USD", "STOCK"),
+    Instrument("VODl_EQ", "Vodafone", "VOD", "GB00BH4HKS39", "GBX", "STOCK"),
+]
+
+
+def make_open_runtime(storage, ai_response, *, tmp_path, symbol_prices, usd_rate="1.25"):
+    config = make_config(mode="paper", enforce_allowlist=False, max_trades_per_day=5)
+    fx = FxConverter(
+        client=httpx.Client(transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json={
+                "chart": {"result": [{"meta": {"regularMarketPrice": float(usd_rate)}}]}
+            })
+        )),
+        clock=lambda: 0.0,
+    )
+    resolver = SymbolResolver(
+        overrides={"NVDA_US_EQ": "NVDA", "VODl_EQ": "VOD.L"},
+        cache_path=tmp_path / "symbol_map.json",
+        client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(404))),
+    )
+    return Runtime(
+        config=config,
+        storage=storage,
+        market=StaticMarketData({TICKER: dec(10), OTHER: dec(7)}, symbol_prices=symbol_prices),
+        ai=StubProvider(response=ai_response),
+        client=None,
+        executor=Executor(config, storage),
+        catalogue=InstrumentCatalogue(_UNIVERSE),
+        fx=fx,
+        resolver=resolver,
+    )
+
+
+def buy_response(notional=10, ticker=TICKER, confidence=0.9, price=10) -> str:
     return json.dumps(
         {
             "action": "buy",
             "ticker": ticker,
             "notional_or_qty": notional,
             "size_unit": "gbp",
-            "price": 10,
+            "price": price,
             "confidence": confidence,
             "reasoning": "test buy",
         }
@@ -213,6 +251,118 @@ def test_no_api_key_ever_appears_in_the_audit_log(storage):
     )
     for secret in ("Authorization", "Basic ", "sk-", "Bearer "):
         assert secret not in dump
+
+
+# --------------------------------------------------------------------------- #
+# The advice ladder: budget guard, local fallback, cache skip
+# --------------------------------------------------------------------------- #
+
+
+class SpyProvider:
+    """Counts calls so a test can assert the model was (or was not) consulted."""
+
+    def __init__(self, name="openrouter", response=None):
+        self.name = name
+        self.model = "spy/free"
+        self.last_model = "spy/free"
+        self.last_http_calls = 1
+        self.calls = 0
+        self._response = response or json.dumps({"action": "hold", "confidence": 1})
+
+    def complete(self, system, user):
+        self.calls += 1
+        return self._response
+
+
+def _utc_today():
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).date()
+
+
+def test_a_spent_budget_hands_over_to_the_local_strategy(storage):
+    provider = SpyProvider(name="openrouter")
+    runtime = make_runtime(storage)
+    runtime.ai = provider
+    storage.record_ai_calls(_utc_today(), runtime.config.ai.daily_request_budget)
+
+    run_cycle(runtime, force=True)
+
+    assert provider.calls == 0                       # never hit the network
+    row = storage.recent_decisions(1)[0]
+    assert row["provider"] == "local"
+
+
+def test_an_unchanged_market_skips_the_second_ai_call(storage):
+    provider = SpyProvider(name="openrouter")
+    runtime = make_runtime(storage)
+    runtime.ai = provider
+
+    assert run_cycle(runtime, force=True) == "no-trade"
+    assert provider.calls == 1
+    # Nothing changed and the last cycle held -> the model is not asked again.
+    assert run_cycle(runtime, force=True) == "no-trade"
+    assert provider.calls == 1
+    assert storage.recent_decisions(1)[0]["provider"] == "cache"
+
+
+def test_a_provider_failure_falls_back_to_local_not_a_blind_hold(storage):
+    class Broken(SpyProvider):
+        def complete(self, system, user):
+            from t212bot.ai_advisor import ProviderError
+
+            self.calls += 1
+            raise ProviderError("network down")
+
+    runtime = make_runtime(storage)
+    runtime.ai = Broken(name="openrouter")
+    run_cycle(runtime, force=True)
+
+    row = storage.recent_decisions(1)[0]
+    assert row["provider"] == "local"
+
+
+# --------------------------------------------------------------------------- #
+# Open-universe mode
+# --------------------------------------------------------------------------- #
+
+
+def test_open_universe_resolves_prices_and_converts_a_us_stock(storage, tmp_path):
+    runtime = make_open_runtime(
+        storage,
+        buy_response(ticker="Nvidia", notional=10, price=None),
+        tmp_path=tmp_path,
+        symbol_prices={"NVDA": (dec("125"), "USD")},   # $125 -> £100 at 1.25
+    )
+    assert run_cycle(runtime, force=True) == "order:filled"
+    quantity, avg = storage.paper_positions()["NVDA_US_EQ"]
+    # £10 buy at a £100 GBP-equivalent price -> 0.1 shares
+    assert quantity == dec("0.1")
+    assert dec("99") < avg < dec("101")
+
+
+def test_open_universe_prices_a_london_stock_without_fx(storage, tmp_path):
+    runtime = make_open_runtime(
+        storage,
+        buy_response(ticker="VODl_EQ", notional=10, price=None),
+        tmp_path=tmp_path,
+        symbol_prices={"VOD.L": (dec("7000"), "GBp")},   # 7000p -> £70
+    )
+    assert run_cycle(runtime, force=True) == "order:filled"
+    quantity, _ = storage.paper_positions()["VODl_EQ"]
+    assert quantity == dec("0.142857")  # £10 / £70, floored to 6dp
+
+
+def test_open_universe_rejects_a_hallucinated_ticker(storage, tmp_path):
+    runtime = make_open_runtime(
+        storage,
+        buy_response(ticker="TotallyMadeUpCo", notional=10),
+        tmp_path=tmp_path,
+        symbol_prices={},
+    )
+    assert run_cycle(runtime, force=True) == "no-trade"
+    assert storage.recent_decisions(1)[0]["rule"] == "R05_ALLOWLIST"
+    assert storage.paper_positions() == {}
 
 
 def test_a_cycle_never_exceeds_the_capital_cap_over_many_runs(storage):

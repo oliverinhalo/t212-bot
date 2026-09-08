@@ -13,12 +13,13 @@ does not spend API quota deciding things it will not act on.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import logging.handlers
 import signal
 import sys
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time as dtime
 from decimal import Decimal
 from typing import Any
@@ -28,8 +29,18 @@ from . import __version__
 from .ai_advisor import advise, build_provider as build_ai_provider
 from .config import AppConfig, ConfigError, load
 from .executor import Executor
-from .market_data import Snapshot, build_provider as build_market_provider
-from .models import RiskInputs, money, summarise_positions, utcnow
+from .fx import FxConverter, FxError
+from .indicators import compute_all, compute_signals, market_regime
+from .instruments import InstrumentCatalogue
+from .local_strategy import advise_locally
+from .market_data import (
+    MarketDataError,
+    Snapshot,
+    SymbolResolver,
+    build_provider as build_market_provider,
+    currencies_match,
+)
+from .models import ZERO, AIResult, Proposal, RiskInputs, money, summarise_positions, utcnow
 from .portfolio import load_account_state
 from .risk_manager import circuit_breaker_state, evaluate
 from .storage import Storage
@@ -81,9 +92,14 @@ class Runtime:
     ai: Any
     client: T212Client | None
     executor: Executor
+    catalogue: InstrumentCatalogue | None = None
+    fx: FxConverter | None = None
+    resolver: SymbolResolver | None = None
 
     def close(self) -> None:
-        for target in (self.market, self.ai, self.client, self.storage):
+        for target in (
+            self.market, self.ai, self.client, self.fx, self.resolver, self.storage
+        ):
             closer = getattr(target, "close", None)
             if callable(closer):
                 try:
@@ -107,6 +123,30 @@ def build_runtime(config: AppConfig) -> Runtime:
             auth_scheme=config.t212_auth_scheme,
         )
 
+    # Open-universe mode: the catalogue is the ticker safety net and the FX
+    # layer values foreign instruments in GBP. config.load() has already
+    # guaranteed the catalogue file exists when enforce_allowlist is off.
+    catalogue: InstrumentCatalogue | None = None
+    fx: FxConverter | None = None
+    resolver: SymbolResolver | None = None
+    if not config.risk.enforce_allowlist:
+        catalogue = InstrumentCatalogue.load(config.instruments_path)
+        if catalogue is None or len(catalogue) == 0:
+            raise ConfigError(
+                f"instrument catalogue {config.instruments_path} is missing or empty — "
+                "run: python -m scripts.list_instruments --refresh"
+            )
+        fx = FxConverter(
+            timeout=config.market_data.timeout_seconds,
+            cache_seconds=config.market_data.fx_cache_seconds,
+        )
+        resolver = SymbolResolver(
+            overrides=config.symbol_overrides,
+            cache_path=config.instruments_path.parent / "symbol_map.json",
+            timeout=config.market_data.timeout_seconds,
+            search=config.market_data.symbol_search,
+        )
+
     return Runtime(
         config=config,
         storage=storage,
@@ -114,6 +154,9 @@ def build_runtime(config: AppConfig) -> Runtime:
         ai=build_ai_provider(config),
         client=client,
         executor=Executor(config, storage, client),
+        catalogue=catalogue,
+        fx=fx,
+        resolver=resolver,
     )
 
 
@@ -150,6 +193,226 @@ def within_trading_window(config: AppConfig, now: datetime | None = None) -> tup
             f"{config.schedule.timezone}"
         )
     return True, ""
+
+
+# --------------------------------------------------------------------------- #
+# Advice: LLM, or local fallback, or a cached hold
+# --------------------------------------------------------------------------- #
+
+
+def _cycle_fingerprint(
+    account: Any,
+    snapshot: Snapshot,
+    trades_today: int,
+    regime: str,
+    min_move_pct: Decimal,
+) -> str:
+    """A stable digest of everything that would change the AI's answer.
+
+    Prices are bucketed by ``min_move_pct`` so a sub-threshold tick does not
+    invalidate the cache; positions are included verbatim.
+    """
+    rel = max(min_move_pct, Decimal("0.01")) / Decimal(100)
+    parts = [f"regime={regime}", f"trades={trades_today}"]
+    for ticker in sorted(snapshot.quotes):
+        price = snapshot.quotes[ticker].price
+        bucket = "0" if price <= ZERO else str(int(price / (price * rel)))
+        parts.append(f"{ticker}={bucket}")
+    for position in sorted(account.positions, key=lambda p: p.ticker):
+        parts.append(f"pos:{position.ticker}={position.quantity}")
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
+
+def _synth_hold(provider: str, model: str, reason: str) -> AIResult:
+    return AIResult(
+        proposal=Proposal(action="hold", reasoning=reason),
+        provider=provider,
+        model=model,
+        prompt="",
+        raw_response="",
+        latency_ms=0,
+        error=None,
+        http_calls=0,
+    )
+
+
+def decide_advice(
+    runtime: Runtime,
+    account: Any,
+    snapshot: Snapshot,
+    signals: dict,
+    regime: str,
+    *,
+    trades_today: int,
+    day_pnl: Decimal,
+    trading_day: date,
+) -> AIResult:
+    """The decision ladder: cache skip -> budget guard -> LLM -> local fallback."""
+    config = runtime.config
+    storage = runtime.storage
+    provider_name = getattr(runtime.ai, "name", "unknown")
+    fingerprint = _cycle_fingerprint(
+        account, snapshot, trades_today, regime, config.ai.min_price_move_pct
+    )
+    utc_day = utcnow().date()
+
+    def finish(result: AIResult) -> AIResult:
+        storage.record_cycle_fingerprint(trading_day, fingerprint, result.proposal.action)
+        return result
+
+    # 1. Nothing material changed since a cycle that held — do not spend a call.
+    if config.ai.skip_when_unchanged and storage.last_cycle_fingerprint() == (
+        fingerprint,
+        "hold",
+    ):
+        log.info("no material change since the last cycle; skipping the AI call")
+        return finish(
+            _synth_hold("cache", "skip", "No material change since the last cycle; held.")
+        )
+
+    # 2. Free-tier daily budget. Hand over to the local strategy before the cap.
+    if provider_name == "openrouter":
+        used = storage.ai_calls_today(utc_day)
+        if used >= config.ai.daily_request_budget:
+            log.warning(
+                "OpenRouter budget spent (%d/%d today) — using the local strategy",
+                used,
+                config.ai.daily_request_budget,
+            )
+            if config.ai.local_fallback:
+                return finish(
+                    advise_locally(
+                        config, account, snapshot, signals, regime,
+                        trades_today=trades_today, day_pnl=day_pnl,
+                    )
+                )
+            return finish(
+                _synth_hold(
+                    "budget", "none",
+                    f"OpenRouter daily budget spent ({used}/{config.ai.daily_request_budget}).",
+                )
+            )
+
+    # 3. Normal path: ask the model.
+    result = advise(
+        runtime.ai, config, account, snapshot,
+        signals=signals, regime=regime,
+        open_universe=not config.risk.enforce_allowlist,
+        trades_today=trades_today, day_pnl=day_pnl,
+    )
+    if provider_name == "openrouter" and result.http_calls:
+        storage.record_ai_calls(utc_day, result.http_calls)
+
+    # 4. The model failed. A local proposal beats a blind hold.
+    if result.error and config.ai.local_fallback and provider_name in ("openrouter", "omniroute"):
+        log.warning("AI provider failed (%s) — using the local strategy", result.error)
+        local = advise_locally(
+            config, account, snapshot, signals, regime,
+            trades_today=trades_today, day_pnl=day_pnl,
+        )
+        return finish(
+            replace(local, error=f"LLM unavailable ({result.error}); local strategy used")
+        )
+
+    return finish(result)
+
+
+# --------------------------------------------------------------------------- #
+# Open-universe: resolve and price an instrument the AI named off the list
+# --------------------------------------------------------------------------- #
+
+
+def resolve_off_list_instrument(
+    runtime: Runtime,
+    proposal: Proposal,
+    snapshot: Snapshot,
+    signals: dict,
+) -> tuple[Proposal, dict | None]:
+    """Price an off-watch-list instrument the AI proposed.
+
+    Returns ``(proposal, audit)``. ``proposal.ticker`` is rewritten to the
+    canonical Trading212 ticker on success and the quote/history are inserted
+    into ``snapshot`` (its dicts are mutable). On *any* failure the proposal is
+    returned unchanged with no quote added, so the risk manager rejects it
+    (R05_ALLOWLIST via the priced-ticker set, or R06_QUOTE_MISSING).
+    """
+    config = runtime.config
+    if (
+        config.risk.enforce_allowlist
+        or not proposal.is_trade
+        or not proposal.ticker
+        or proposal.ticker in snapshot.quotes
+        or runtime.catalogue is None
+    ):
+        return proposal, None
+
+    def fail(resolved: str | None, reason: str, **extra: object) -> tuple[Proposal, dict]:
+        log.warning("off-list %r rejected: %s", proposal.ticker, reason)
+        return proposal, {"query": proposal.ticker, "resolved": resolved, "reason": reason, **extra}
+
+    instrument = runtime.catalogue.resolve(proposal.ticker)
+    if instrument is None:
+        return fail(None, "not found in the Trading212 catalogue")
+    if not instrument.is_equity_like:
+        return fail(instrument.ticker, f"instrument type is {instrument.type or 'unknown'}")
+
+    symbol = runtime.resolver.resolve(instrument) if runtime.resolver else None
+    if not symbol:
+        return fail(instrument.ticker, "no Yahoo symbol could be resolved", isin=instrument.isin)
+
+    try:
+        quote, history = runtime.market.fetch_symbol(
+            instrument.ticker, symbol, config.max_history_days
+        )
+    except MarketDataError as exc:
+        return fail(instrument.ticker, f"quote fetch failed: {exc}", yahoo=symbol)
+
+    if not currencies_match(quote.currency, instrument.currency):
+        return fail(
+            instrument.ticker,
+            f"currency mismatch (Yahoo {quote.currency} vs T212 {instrument.currency}) "
+            "— probably the wrong listing",
+            yahoo=symbol,
+        )
+
+    native_price, native_currency = quote.price, quote.currency
+    fx_rate = Decimal(1)
+    gbp_price = quote.price
+    if instrument.currency not in ("", "GBP", "GBX", "GBP.") and runtime.fx is not None:
+        try:
+            fx_rate = runtime.fx.rate(instrument.currency)
+        except FxError as exc:
+            return fail(instrument.ticker, f"FX conversion failed: {exc}", yahoo=symbol)
+        gbp_price = quote.price / fx_rate
+
+    quote = replace(
+        quote,
+        price=gbp_price,
+        currency="GBP",
+        native_currency=native_currency,
+        native_price=native_price,
+    )
+    if fx_rate != Decimal(1):
+        history = replace(
+            history,
+            bars=tuple(replace(bar, close=bar.close / fx_rate) for bar in history.bars),
+        )
+
+    snapshot.quotes[instrument.ticker] = quote
+    snapshot.histories[instrument.ticker] = history
+    sig = compute_signals(history, quote, config.ai.indicators)
+    if sig is not None:
+        signals[instrument.ticker] = sig
+
+    audit = {
+        "query": proposal.ticker,
+        "resolved": instrument.ticker,
+        "yahoo": symbol,
+        "native": f"{native_price} {native_currency}",
+        "gbp_price": str(money(gbp_price)),
+        "fx_rate": str(fx_rate),
+    }
+    return replace(proposal, ticker=instrument.ticker), audit
 
 
 # --------------------------------------------------------------------------- #
@@ -208,15 +471,30 @@ def run_cycle(runtime: Runtime, *, dry_run: bool = False, force: bool = False) -
         log.warning("order reconciliation failed: %s", exc)
 
     # 6. Market data. Tickers that fail are simply untradeable this cycle.
-    snapshot: Snapshot = runtime.market.fetch(config.watchlist, config.ai.history_days)
+    snapshot: Snapshot = runtime.market.fetch(config.watchlist, config.max_history_days)
     if not snapshot.quotes:
         return halt(f"no market data for any watch-list ticker: {snapshot.errors}")
     for ticker, error in snapshot.errors.items():
         log.warning("no quote for %s: %s", ticker, error)
 
+    # 6b. Local technical analysis over the daily closes. No API cost.
+    signals = compute_all(
+        config.watchlist, snapshot.quotes, snapshot.histories, config.ai.indicators
+    )
+    regime = market_regime(config.watchlist, signals)
+    if signals:
+        log.info(
+            "regime %s; %s",
+            regime,
+            ", ".join(f"{t} {s.trend}({s.score:+.2f})" for t, s in signals.items()),
+        )
+
     # 7. Account state.
     try:
-        account = load_account_state(config, storage, runtime.client, snapshot.prices())
+        account = load_account_state(
+            config, storage, runtime.client, snapshot.prices(),
+            catalogue=runtime.catalogue, fx=runtime.fx,
+        )
     except (T212Error, ValueError) as exc:
         return halt(f"could not load account state: {exc}", status="error")
 
@@ -225,9 +503,8 @@ def run_cycle(runtime: Runtime, *, dry_run: bool = False, force: bool = False) -
     tripped, pnl, limit = circuit_breaker_state(day_start_equity, account.equity, config)
     trades_today = storage.trades_today(day)
 
-    storage.record_snapshot(
-        decision_id,
-        {
+    def snapshot_record() -> dict:
+        return {
             "as_of": now.isoformat(),
             "mode": config.mode,
             "cash": str(account.cash),
@@ -243,12 +520,20 @@ def run_cycle(runtime: Runtime, *, dry_run: bool = False, force: bool = False) -
                     "currency": quote.currency,
                     "as_of": quote.as_of.isoformat(),
                     "source": quote.source,
+                    **(
+                        {"native": f"{quote.native_price} {quote.native_currency}"}
+                        if quote.native_price is not None
+                        else {}
+                    ),
                 }
                 for ticker, quote in snapshot.quotes.items()
             },
             "quote_errors": snapshot.errors,
-        },
-    )
+            "regime": regime,
+            "signals": {ticker: sig.as_dict() for ticker, sig in signals.items()},
+        }
+
+    storage.record_snapshot(decision_id, snapshot_record())
 
     log.info(
         "equity %s (cash %s, invested %s), P&L today %s of %s limit, trades %d/%d",
@@ -266,14 +551,16 @@ def run_cycle(runtime: Runtime, *, dry_run: bool = False, force: bool = False) -
         storage.trip_breaker(day, reason, pnl)
         return halt(f"circuit breaker tripped: {reason}")
 
-    # 9. Ask the AI.
-    result = advise(
-        runtime.ai,
-        config,
+    # 9. Ask the AI — or the local strategy, or a cached hold if nothing moved.
+    result = decide_advice(
+        runtime,
         account,
         snapshot,
+        signals,
+        regime,
         trades_today=trades_today,
         day_pnl=pnl,
+        trading_day=day,
     )
     storage.record_ai(decision_id, result)
     log.info(
@@ -286,7 +573,23 @@ def run_cycle(runtime: Runtime, *, dry_run: bool = False, force: bool = False) -
         result.proposal.reasoning[:200],
     )
 
+    # 9b. Open-universe: price an instrument the AI named that we do not already
+    #     hold data for. On any failure it is simply left unpriced and the risk
+    #     manager rejects it (R05/R06).
+    proposal, resolution = resolve_off_list_instrument(
+        runtime, result.proposal, snapshot, signals
+    )
+    if resolution is not None:
+        record = snapshot_record()
+        record["resolved"] = resolution
+        storage.record_snapshot(decision_id, record)
+        log.info("off-list instrument: %s", resolution)
+
     # 10. Risk manager. The only thing that can authorise an order.
+    if config.risk.enforce_allowlist:
+        allowed_tickers: frozenset[str] | None = None
+    else:
+        allowed_tickers = frozenset(snapshot.quotes)
     inputs = RiskInputs(
         decision_id=decision_id,
         account=account,
@@ -297,8 +600,9 @@ def run_cycle(runtime: Runtime, *, dry_run: bool = False, force: bool = False) -
         known_decision_ids=storage.known_decision_ids(),
         unresolved_orders=0,
         now=utcnow(),
+        allowed_tickers=allowed_tickers,
     )
-    verdict = evaluate(result.proposal, inputs, config)
+    verdict = evaluate(proposal, inputs, config)
     storage.record_verdict(decision_id, verdict)
 
     if not verdict.approved:

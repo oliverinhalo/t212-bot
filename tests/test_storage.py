@@ -269,3 +269,27 @@ def test_the_prompt_and_raw_response_are_kept_verbatim(storage):
     row = storage._read("SELECT prompt, raw_response FROM ai_decisions")[0]
     assert row["prompt"] == "the full prompt"
     assert row["raw_response"] == "the raw reply"
+
+
+# --------------------------------------------------------------------------- #
+# AI budget accounting and the cycle cache
+# --------------------------------------------------------------------------- #
+
+
+def test_ai_calls_accumulate_per_day(storage):
+    assert storage.ai_calls_today(DAY) == 0
+    storage.record_ai_calls(DAY, 1)
+    storage.record_ai_calls(DAY, 2)
+    assert storage.ai_calls_today(DAY) == 3
+    storage.record_ai_calls(DAY, 0)          # no-op
+    storage.record_ai_calls(DAY, -5)         # never decrements
+    assert storage.ai_calls_today(DAY) == 3
+    assert storage.ai_calls_today(date(2026, 3, 3)) == 0
+
+
+def test_the_cycle_fingerprint_round_trips_and_is_singular(storage):
+    assert storage.last_cycle_fingerprint() is None
+    storage.record_cycle_fingerprint(DAY, "abc123", "hold")
+    assert storage.last_cycle_fingerprint() == ("abc123", "hold")
+    storage.record_cycle_fingerprint(DAY, "def456", "buy")
+    assert storage.last_cycle_fingerprint() == ("def456", "buy")

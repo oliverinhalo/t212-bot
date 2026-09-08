@@ -100,6 +100,28 @@ def test_missing_ticker_is_rejected(config):
     assert verdict.rule == "R05_ALLOWLIST"
 
 
+def test_open_universe_gate_uses_the_priced_ticker_set(config):
+    """With enforce_allowlist off, main.py passes the set of tickers it priced.
+
+    A ticker in that set (it resolved and got a quote) is allowed even though it
+    is not on the watch-list; one that is not in the set is still rejected.
+    """
+    quote = make_quote("NVDA_US_EQ", 100)
+    ok = evaluate(
+        buy(ticker="NVDA_US_EQ", notional=10),
+        make_inputs(quotes={"NVDA_US_EQ": quote}, allowed_tickers=["NVDA_US_EQ"]),
+        config,
+    )
+    assert ok.approved
+
+    blocked = evaluate(
+        buy(ticker="NVDA_US_EQ", notional=10),
+        make_inputs(quotes={"NVDA_US_EQ": quote}, allowed_tickers=[TICKER]),
+        config,
+    )
+    assert blocked.rule == "R05_ALLOWLIST"
+
+
 # --------------------------------------------------------------------------- #
 # Quotes
 # --------------------------------------------------------------------------- #

@@ -80,6 +80,11 @@ class Quote:
     currency: str
     as_of: datetime
     source: str
+    # Set when ``price`` has been converted from a foreign currency: the
+    # original figure and its currency, kept for the audit log only. The risk
+    # manager and every capital check use ``price`` (always the GBP value).
+    native_currency: str = ""
+    native_price: Decimal | None = None
 
     def age_seconds(self, now: datetime | None = None) -> float:
         return ((now or utcnow()) - self.as_of).total_seconds()
@@ -193,6 +198,10 @@ class AIResult:
     raw_response: str
     latency_ms: int
     error: str | None = None
+    # HTTP calls this result actually cost, for the OpenRouter daily budget.
+    # A cache hit or the local strategy cost 0; a single LLM call costs 1; a
+    # fallback down a model chain costs one per attempt.
+    http_calls: int = 0
 
 
 @dataclass(frozen=True)
@@ -212,6 +221,10 @@ class RiskInputs:
     known_decision_ids: frozenset[str] = frozenset()
     unresolved_orders: int = 0
     now: datetime = field(default_factory=utcnow)
+    # The set of tickers the AI is allowed to act on this cycle. ``None`` means
+    # "fall back to config.allowed_tickers" (the watch-list). In open-universe
+    # mode main.py passes the set of tickers it actually obtained a quote for.
+    allowed_tickers: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)

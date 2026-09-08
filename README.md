@@ -39,16 +39,22 @@ call, so a halted bot spends no API quota.
 
 ```
 kill switch → unresolved orders → circuit breaker → market hours
-  → market data → account state → P&L and breaker check
-  → AI proposal → risk manager → execute → audit log
+  → market data → technical signals → account state → P&L and breaker check
+  → AI proposal (model, or local strategy, or cached hold)
+  → resolve + price the named instrument (open-universe) → risk manager
+  → execute → audit log
 ```
 
 | Module | Responsibility |
 |---|---|
 | `t212bot/config.py` | Loads `config.yaml` + `.env`, validates every cap, resolves the mode |
 | `t212bot/t212_client.py` | Rate-limit-aware Trading212 wrapper. The only HTTP client for the broker |
-| `t212bot/market_data.py` | Quotes and daily closes (Yahoo Finance — T212 has no quote endpoint) |
-| `t212bot/ai_advisor.py` | Builds the prompt, calls the provider, parses JSON defensively |
+| `t212bot/market_data.py` | Quotes and daily closes (Yahoo Finance — T212 has no quote endpoint); Yahoo symbol resolution |
+| `t212bot/instruments.py` | The Trading212 instrument catalogue — resolves any name the AI gives to a real ticker |
+| `t212bot/fx.py` | Converts a foreign-currency quote to GBP (open-universe mode) |
+| `t212bot/indicators.py` | Local technical analysis over the daily closes (SMA/RSI/vol/momentum, trend, regime) |
+| `t212bot/ai_advisor.py` | Builds the prompt, calls the provider (model fallback chain), parses JSON defensively |
+| `t212bot/local_strategy.py` | Deterministic rule-based advisor: the fallback when the LLM is unavailable or the budget is spent |
 | **`t212bot/risk_manager.py`** | **Pure functions. The only module that can authorise an order** |
 | `t212bot/executor.py` | Places the order. The only module that calls an order endpoint |
 | `t212bot/storage.py` | SQLite audit trail, paper ledger, duplicate-order guard |
@@ -75,7 +81,7 @@ the audit log, and each is asserted in `tests/test_risk_manager.py`.
 | 3 | **Per-trade cap.** No single order over `per_trade_cap_pct` of capital (default 25% = £12.50). A separate `max_position_pct` caps the accumulated holding per ticker | `R15_POSITION_CAP` | `risk_manager._size_buy` |
 | 4 | **Daily loss circuit breaker.** At −`daily_loss_limit_pct` of capital (default −10% = −£5), trading halts and stays halted until `--reset-breaker` | `R01_BREAKER` | `risk_manager.circuit_breaker_state` |
 | 5 | **Trade-frequency cap.** `max_trades_per_day` (default 5), counting attempts, not fills | `R10_FREQUENCY` | `risk_manager.evaluate` |
-| 6 | **Explicit ticker allow-list.** The AI can only act on tickers in `config.yaml`; anything else is rejected before it reaches the broker | `R05_ALLOWLIST` | `risk_manager.evaluate` |
+| 6 | **Ticker allow-list.** With `risk.enforce_allowlist: true` (default) the AI can only act on watch-list tickers. With it `false` (open-universe) the AI may name any instrument, but it must resolve against the Trading212 catalogue — a hallucinated ticker is still rejected before the broker | `R05_ALLOWLIST` | `risk_manager.evaluate` |
 | 7 | **No leverage, no shorting, no options.** Structurally: the client has no method that could express one, and a sell is clamped to the quantity actually held | `R18_NO_POSITION` | `t212_client`, `risk_manager._size_sell` |
 | 8 | **Every proposal is sanity-checked.** Unknown ticker, missing/stale/zero quote, implied price far from the market, low confidence, or any cap breach → rejected or shrunk | `R05`–`R17` | `risk_manager.evaluate` |
 | 9 | **Duplicate-order guard.** One decision id claims at most one order row, written to SQLite *before* the HTTP call. Survives retries and crashes | `R03_DUPLICATE` | `storage.reserve_order` |
@@ -225,7 +231,7 @@ left in `reserved`/`submitting` becomes `unknown`.
 have a documented `.example` alongside them. The loader is strict — a malformed
 or impossible cap is a startup error, not a silent default.
 
-The watch-list is the allow-list:
+The watch-list is the allow-list (unless open-universe mode is on, below):
 
 ```yaml
 watchlist:
@@ -234,6 +240,32 @@ watchlist:
     name: Vanguard S&P 500 UCITS ETF
     max_position_pct: 20.0    # optional per-ticker override
 ```
+
+### Open-universe mode
+
+`risk.enforce_allowlist: false` lets the AI name **any** Trading212 instrument,
+not just the watch-list. One-time setup:
+
+```bash
+python -m scripts.list_instruments --refresh   # caches data/instruments.json
+```
+
+Per cycle, when the AI names something off the watch-list:
+
+1. it is resolved against `data/instruments.json` (by ticker, symbol, ISIN, or
+   unique name) — **an unknown or ambiguous name is rejected** (`R05`);
+2. a Yahoo symbol is found (override → `data/symbol_map.json` cache → Yahoo ISIN
+   search → derived from the exchange suffix), with a currency cross-check;
+3. the quote is fetched and **converted to GBP** via a live FX rate, so every
+   cap still binds correctly;
+4. only then does it enter the unchanged risk manager.
+
+The watch-list still matters: it is the set with full technical signals, and the
+local fallback strategy only operates on it. Pin a wrong symbol lookup with
+`market_data.symbol_overrides`. **Caveat:** symbol resolution for obscure or
+dual-listed instruments can pick the wrong listing — check `data/symbol_map.json`
+and the `--status` prices. Broker-mode position values for foreign holdings are
+converted using the same FX layer.
 
 Key caps, with their defaults for £50 of capital:
 
@@ -253,19 +285,47 @@ Key caps, with their defaults for £50 of capital:
 
 ### AI provider
 
-`ai.provider: auto` picks Anthropic if `ANTHROPIC_API_KEY` is set, otherwise
-OpenRouter. Pin it with `openrouter`, `anthropic`, or `stub`.
+`ai.provider: auto` picks Anthropic if `ANTHROPIC_API_KEY` is set, else
+OpenRouter if `OPENROUTER_API_KEY` is set, else OmniRoute if
+`OMNIROUTE_API_KEY` is set. Pin it with `openrouter`, `omniroute`,
+`anthropic`, or `stub`.
 
-- **OpenRouter** (default, free): the `openrouter/free` auto-router is used so
-  the config does not go stale when a specific free model is retired. Free tier
-  is roughly 20 requests/minute and 50/day — ample for a few cycles a day.
-- **Anthropic**: `claude-haiku-4-5` by default — a short prompt, a tiny JSON
-  reply, a few calls a day. Needs `pip install "anthropic>=1.0,<2"`.
+- **OpenRouter** (default, free): `ai.openrouter.models` is a fallback chain,
+  tried in order until one answers, so a single free model being rate-limited
+  or retired does not lose the cycle. Put `openrouter/free` (the auto-router)
+  last. Free tier is roughly 20 requests/minute and 50/day.
+- **OmniRoute**: a self-hosted/private OpenAI-compatible router — same wire
+  format as OpenRouter (model fallback chain, JSON-mode retry), just pointed
+  at your own instance. Set `ai.omniroute.base_url` (or override per-environment
+  with `OMNIROUTE_BASE_URL` in `.env`, e.g. to switch between a local instance
+  and a remote one) and `ai.omniroute.models`/`.model`; the key comes from
+  `OMNIROUTE_API_KEY`. Not subject to the OpenRouter free-tier budget below.
+- **Anthropic**: `claude-haiku-4-5` by default. Needs `pip install
+  "anthropic>=1.0,<2"`.
 - **`stub`**: always returns `hold`. Exercises the whole pipeline with no API
   calls and no key.
 
-A provider failure degrades to `hold`, with the error recorded. It never
-crashes the cycle and never trades on a guess.
+**Staying inside the free tier.** Every OpenRouter HTTP call is counted per UTC
+day in SQLite (`ai_usage`). Three things keep the bot under the cap:
+
+| Mechanism | Config | Effect |
+|---|---|---|
+| Daily budget | `ai.daily_request_budget` (45) | Past this, the **local strategy** runs instead of the model for the rest of the day |
+| Cache skip | `ai.skip_when_unchanged` (true) | If nothing moved more than `ai.min_price_move_pct` since a cycle that held, the model is not called at all |
+| Local fallback | `ai.local_fallback` (true) | A model failure or refusal falls back to the local strategy, not a blind `hold` |
+
+**Local technical signals** (`ai.indicators`, no API cost) are computed from the
+Yahoo daily closes — SMA/RSI/annualised vol/momentum/drawdown, a per-ticker
+trend label and score, and a coarse market regime — and fed into the prompt as
+a `TECHNICAL SIGNALS` block.
+
+**The local strategy** (`ai.local_strategy`) is a deterministic, rule-based
+advisor: stop-loss → trend exit → take-profit → one cautious entry → hold. It
+emits the same JSON contract as the model and its proposal goes through the
+**same risk manager** — it is never an order authoriser.
+
+A provider failure with local fallback disabled still degrades to `hold`, with
+the error recorded. Nothing here ever crashes the cycle or trades on a guess.
 
 ---
 
@@ -281,6 +341,8 @@ Everything lands in `data/t212bot.sqlite3`:
 | `orders` | One row per decision id, its state, broker id, fill price and quantity |
 | `daily` | Start equity, last equity, realised P&L per day |
 | `breaker` | Whether the circuit breaker is tripped, and why |
+| `ai_usage` | OpenRouter HTTP calls made per UTC day, for the free-tier budget |
+| `ai_cycle_state` | Fingerprint + action of the last cycle, for the cache skip |
 
 Money is stored as TEXT and handled as `Decimal` throughout. No API key ever
 reaches this database; there is a test that greps the whole thing for

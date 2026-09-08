@@ -53,6 +53,7 @@ def make_config(
     max_price_deviation_pct: str | float = 2,
     max_quote_age_seconds: int = 900,
     min_confidence: str | float = "0.6",
+    enforce_allowlist: bool = True,
     order_type: str = "market",
     quantity_decimals: int = 6,
     fractional: bool = True,
@@ -74,6 +75,7 @@ def make_config(
             max_price_deviation_pct=dec(max_price_deviation_pct),
             max_quote_age_seconds=max_quote_age_seconds,
             min_confidence=dec(min_confidence),
+            enforce_allowlist=enforce_allowlist,
         ),
         execution=ExecutionConfig(
             order_type=order_type,
@@ -152,6 +154,7 @@ def make_inputs(
     breaker_tripped: bool = False,
     known_decision_ids: Iterable[str] = (),
     unresolved_orders: int = 0,
+    allowed_tickers: Iterable[str] | None = None,
 ) -> RiskInputs:
     return RiskInputs(
         decision_id=decision_id,
@@ -163,6 +166,7 @@ def make_inputs(
         known_decision_ids=frozenset(known_decision_ids),
         unresolved_orders=unresolved_orders,
         now=utcnow(),
+        allowed_tickers=None if allowed_tickers is None else frozenset(allowed_tickers),
     )
 
 

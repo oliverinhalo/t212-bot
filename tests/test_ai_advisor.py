@@ -6,6 +6,7 @@ import json
 from datetime import date, timedelta
 
 from t212bot.ai_advisor import (
+    OmniRouteProvider,
     OpenRouterProvider,
     StubProvider,
     advise,
@@ -245,3 +246,133 @@ def test_openrouter_requires_a_key():
 
     with pytest.raises(ProviderError, match="OPENROUTER_API_KEY"):
         OpenRouterProvider(api_key="", model="openrouter/free")
+
+
+# --------------------------------------------------------------------------- #
+# OpenRouter provider: model fallback chain, JSON-mode retry, reasoning traces
+# --------------------------------------------------------------------------- #
+
+import json as _json
+
+import httpx
+import pytest
+
+from t212bot.ai_advisor import ProviderError, _extract_json
+
+
+def _provider(handler, models):
+    return OpenRouterProvider(
+        api_key="k",
+        models=models,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+
+def _ok_body() -> dict:
+    return {"choices": [{"message": {"content": '{"action": "hold", "confidence": 1}'}}]}
+
+
+def test_openrouter_falls_back_to_the_next_model_on_a_rate_limit():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        model = _json.loads(request.content)["model"]
+        seen.append(model)
+        if model == "first/free":
+            return httpx.Response(429, text="slow down")
+        return httpx.Response(200, json=_ok_body())
+
+    provider = _provider(handler, ["first/free", "second/free"])
+    assert provider.complete("sys", "user") == '{"action": "hold", "confidence": 1}'
+    assert provider.last_model == "second/free"
+    assert provider.last_http_calls == 2
+    assert seen == ["first/free", "second/free"]
+
+
+def test_openrouter_raises_only_when_every_model_fails():
+    provider = _provider(lambda r: httpx.Response(429), ["a/free", "b/free"])
+    with pytest.raises(ProviderError, match="every OpenRouter model failed"):
+        provider.complete("sys", "user")
+
+
+def test_openrouter_retries_without_json_mode_on_a_400():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = _json.loads(request.content)
+        calls.append("response_format" in body)
+        if "response_format" in body:
+            return httpx.Response(400, text="response_format unsupported")
+        return httpx.Response(200, json=_ok_body())
+
+    provider = _provider(handler, ["m/free"])
+    assert provider.complete("s", "u").startswith("{")
+    assert calls == [True, False]
+    # It remembers, so a second call skips structured mode entirely.
+    provider.complete("s", "u")
+    assert calls == [True, False, False]
+
+
+def test_extract_json_strips_a_reasoning_trace():
+    raw = "<think>The user wants me to {consider} things.</think>\n{\"action\": \"buy\"}"
+    assert _extract_json(raw)["action"] == "buy"
+
+
+# --------------------------------------------------------------------------- #
+# OmniRoute provider: same wire format as OpenRouter, its own key/base_url
+# --------------------------------------------------------------------------- #
+
+
+def test_omniroute_requires_a_key():
+    with pytest.raises(ProviderError, match="OMNIROUTE_API_KEY"):
+        OmniRouteProvider(api_key="", base_url="http://127.0.0.1:20128/v1", model="default")
+
+
+def test_omniroute_requires_a_base_url():
+    with pytest.raises(ProviderError, match="base_url"):
+        OmniRouteProvider(api_key="k", base_url="", model="default")
+
+
+def test_omniroute_hits_its_own_base_url_and_reports_its_own_name():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, json=_ok_body())
+
+    provider = OmniRouteProvider(
+        api_key="k",
+        base_url="http://127.0.0.1:20128/v1",
+        model="default",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert provider.name == "omniroute"
+    assert provider.complete("sys", "user") == '{"action": "hold", "confidence": 1}'
+    assert seen == ["http://127.0.0.1:20128/v1/chat/completions"]
+
+
+def test_omniroute_raises_only_when_every_model_fails():
+    provider = OmniRouteProvider(
+        api_key="k",
+        base_url="http://127.0.0.1:20128/v1",
+        models=["a", "b"],
+        client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(429))),
+    )
+    with pytest.raises(ProviderError, match="every OmniRoute model failed"):
+        provider.complete("sys", "user")
+
+
+def test_signals_appear_in_the_prompt_when_supplied():
+    from t212bot.config import IndicatorConfig
+    from t212bot.indicators import compute_all
+
+    config = make_config()
+    snap = snapshot()
+    signals = compute_all(config.watchlist, snap.quotes, snap.histories, IndicatorConfig(min_bars=5))
+    prompt = build_prompt(
+        config, make_account(cash=50), snap,
+        trades_today=0, day_pnl=dec(0), signals=signals, regime="risk_on",
+    )
+    assert "TECHNICAL SIGNALS" in prompt
+    assert "MARKET REGIME: risk on" in prompt
+    assert "trend " in prompt

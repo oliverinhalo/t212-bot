@@ -13,6 +13,7 @@ Bind it to the LAN only (``dashboard.host``) — there is no authentication here
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 
 from flask import Flask, jsonify, render_template_string
 
@@ -60,7 +61,9 @@ PAGE = """
 <body>
   <h1>t212-bot</h1>
   <div class="muted">{{ generated }} &middot; {{ config.ai.provider }} &middot;
-      cap &pound;{{ cap }}</div>
+      cap &pound;{{ cap }}
+      {% if regime %} &middot; regime {{ regime.replace('_', ' ') }}{% endif %}
+      &middot; AI calls {{ api_calls_today }}/{{ api_budget }} today</div>
 
   <div class="banner {{ 'live' if config.mode == 'live' else 'paper' }}">
     MODE: {{ config.mode|upper }}{% if config.mode == 'live' %} — REAL MONEY{% endif %}
@@ -96,7 +99,8 @@ PAGE = """
   {% if positions %}
   <table>
     <tr><th>Ticker</th><th class="num">Qty</th><th class="num">Avg</th>
-        <th class="num">Now</th><th class="num">Value</th><th class="num">P&amp;L</th></tr>
+        <th class="num">Now</th><th class="num">Value</th><th class="num">P&amp;L</th>
+        <th>Trend</th></tr>
     {% for p in positions %}
     <tr>
       <td>{{ p.ticker }}</td>
@@ -106,6 +110,7 @@ PAGE = """
       <td class="num">{{ p.value }}</td>
       <td class="num {{ 'pos' if not p.unrealised_pnl.startswith('-') else 'neg' }}">
         {{ p.unrealised_pnl }}</td>
+      <td class="muted">{{ p.trend or '—' }}</td>
     </tr>
     {% endfor %}
   </table>
@@ -163,6 +168,14 @@ def build_state(config: AppConfig, storage: Storage) -> dict:
     start = dec(row["start_equity"]) if row and row["start_equity"] else equity
     pnl = equity - start
 
+    signals = snapshot.get("signals", {}) or {}
+    positions = snapshot.get("positions", [])
+    for position in positions:
+        sig = signals.get(position.get("ticker"))
+        position["trend"] = sig.get("trend") if sig else None
+
+    utc_day = datetime.now(timezone.utc).date()
+
     return {
         "mode": config.mode,
         "generated": snapshot.get("as_of", "no cycles yet"),
@@ -172,7 +185,10 @@ def build_state(config: AppConfig, storage: Storage) -> dict:
         "pnl": str(money(pnl)),
         "pnl_positive": pnl >= ZERO,
         "trades_today": storage.trades_today(day),
-        "positions": snapshot.get("positions", []),
+        "positions": positions,
+        "regime": snapshot.get("regime", ""),
+        "api_calls_today": storage.ai_calls_today(utc_day),
+        "api_budget": config.ai.daily_request_budget,
         "decisions": storage.recent_decisions(10),
         "breaker": storage.breaker(),
         "unresolved": storage.unresolved_orders(),

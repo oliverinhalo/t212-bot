@@ -151,6 +151,20 @@ CREATE TABLE IF NOT EXISTS breaker (
     reason      TEXT,
     pnl         TEXT
 );
+
+CREATE TABLE IF NOT EXISTS ai_usage (
+    day        TEXT PRIMARY KEY,
+    calls      INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ai_cycle_state (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    trading_day TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
 """
 
 
@@ -278,6 +292,37 @@ class Storage:
                 json.dumps(list(verdict.reasons)),
             ),
         )
+
+    # ------------------------------------------------------- ai budget + cache
+    def record_ai_calls(self, day: date, n: int) -> None:
+        """Add ``n`` OpenRouter HTTP calls to the running total for ``day``."""
+        if n <= 0:
+            return
+        self._write(
+            "INSERT INTO ai_usage (day, calls, updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(day) DO UPDATE SET calls = ai_usage.calls + excluded.calls, "
+            "updated_at = excluded.updated_at",
+            (day.isoformat(), int(n), utcnow().isoformat()),
+        )
+
+    def ai_calls_today(self, day: date) -> int:
+        row = self._read_one("SELECT calls FROM ai_usage WHERE day = ?", (day.isoformat(),))
+        return int(row["calls"]) if row else 0
+
+    def record_cycle_fingerprint(self, trading_day: date, fingerprint: str, action: str) -> None:
+        """Remember the market/account fingerprint of the last completed cycle."""
+        self._write(
+            "INSERT INTO ai_cycle_state (id, trading_day, fingerprint, action, updated_at) "
+            "VALUES (1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET trading_day = excluded.trading_day, "
+            "fingerprint = excluded.fingerprint, action = excluded.action, "
+            "updated_at = excluded.updated_at",
+            (trading_day.isoformat(), fingerprint, action, utcnow().isoformat()),
+        )
+
+    def last_cycle_fingerprint(self) -> tuple[str, str] | None:
+        """``(fingerprint, action)`` from the previous cycle, or None."""
+        row = self._read_one("SELECT fingerprint, action FROM ai_cycle_state WHERE id = 1")
+        return (row["fingerprint"], row["action"]) if row else None
 
     # ---------------------------------------------------------------- orders
     def reserve_order(
