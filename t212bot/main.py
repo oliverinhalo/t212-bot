@@ -368,12 +368,31 @@ def resolve_off_list_instrument(
         return fail(instrument.ticker, f"quote fetch failed: {exc}", yahoo=symbol)
 
     if not currencies_match(quote.currency, instrument.currency):
-        return fail(
-            instrument.ticker,
-            f"currency mismatch (Yahoo {quote.currency} vs T212 {instrument.currency}) "
-            "— probably the wrong listing",
-            yahoo=symbol,
+        # Try derived exchange ticker if ISIN search returned an alternate currency listing
+        derived = (
+            getattr(runtime.resolver, "_derive", lambda _: None)(instrument)
+            if runtime.resolver
+            else None
         )
+        if derived and derived != symbol:
+            try:
+                derived_quote, derived_history = runtime.market.fetch_symbol(
+                    instrument.ticker, derived, config.max_history_days
+                )
+                if currencies_match(derived_quote.currency, instrument.currency):
+                    quote, history, symbol = derived_quote, derived_history, derived
+                    if hasattr(runtime.resolver, "_remember") and instrument.isin:
+                        runtime.resolver._remember(instrument.isin, symbol)
+            except MarketDataError:
+                pass
+
+        if not currencies_match(quote.currency, instrument.currency):
+            return fail(
+                instrument.ticker,
+                f"currency mismatch (Yahoo {quote.currency} vs T212 {instrument.currency}) "
+                "— probably the wrong listing",
+                yahoo=symbol,
+            )
 
     native_price, native_currency = quote.price, quote.currency
     fx_rate = Decimal(1)

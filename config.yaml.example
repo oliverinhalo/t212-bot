@@ -5,46 +5,49 @@
 capital:
   # Hard ceiling on total capital under management, in GBP.
   # No buy may leave (cash spent + position value) above this.
-  max_capital_gbp: 50.00
+  max_capital_gbp: 400.00
 
   # No single position may exceed this % of max_capital_gbp.
-  per_trade_cap_pct: 25.0
+  # 2.5% of 400 = £10 — together with min_order_gbp below this brackets every
+  # order into a £5-£10 micro-trade band, for frequent short-term trading.
+  per_trade_cap_pct: 2.5
 
   # No single ticker's total holding may exceed this % of max_capital_gbp.
   # (per_trade_cap_pct limits one order; this limits the accumulated position.)
+  # Left high relative to per_trade_cap_pct so several micro-buys can stack.
   max_position_pct: 25.0
 
   # Orders smaller than this are rejected rather than shrunk to dust.
-  min_order_gbp: 1.00
+  min_order_gbp: 5.00
 
   # Cash never spent, so a fill that slips slightly cannot overdraw the account.
-  cash_buffer_gbp: 0.50
+  cash_buffer_gbp: 1.00
 
 risk:
   # Circuit breaker: if today's total P&L (realised + unrealised) drops below
   # -(this % of max_capital_gbp), trading halts and stays halted until you run
   #   python -m t212bot.main --reset-breaker
-  daily_loss_limit_pct: 10.0
+  daily_loss_limit_pct: 25.0
 
   # Maximum orders placed per calendar day (Europe/London).
-  max_trades_per_day: 5
+  max_trades_per_day: 50
 
   # Reject an AI proposal whose implied price differs from the last quote by
   # more than this %. Guards against stale/hallucinated prices.
   max_price_deviation_pct: 2.0
 
   # Quotes older than this are treated as missing, and no order is approved.
-  max_quote_age_seconds: 900
+  max_quote_age_seconds: 1800
 
   # Proposals below this confidence are downgraded to hold.
-  min_confidence: 0.60
+  min_confidence: 0.10
 
   # true  — the AI may only act on the watch-list below (the allow-list).
   # false — the AI may name any Trading212 instrument. It is resolved against
   #         data/instruments.json (run `python -m scripts.list_instruments
   #         --refresh` once first), priced on demand via Yahoo, and converted to
   #         GBP. An unknown/invented ticker is still rejected.
-  enforce_allowlist: true
+  enforce_allowlist: false
 
 execution:
   # market | limit. Limit orders are placed at the quote adjusted by
@@ -66,7 +69,8 @@ execution:
 
 schedule:
   # Standard 5-field cron. Local time in the timezone below.
-  cron: "0,30 8-16 * * mon-fri"
+  # Every 10 minutes during market hours — short-term/high-turnover trading.
+  cron: "*/10 8-16 * * mon-fri"
   timezone: Europe/London
 
   # Skip cycles outside these local times (belt and braces with the cron above).
@@ -80,12 +84,11 @@ kill_switch:
   stop_file: ./STOP
 
 ai:
-  # auto | openrouter | omniroute | anthropic | stub
-  #   auto — anthropic if ANTHROPIC_API_KEY is set, else openrouter, else
-  #          omniroute (first of ANTHROPIC_API_KEY / OPENROUTER_API_KEY /
-  #          OMNIROUTE_API_KEY found, in that order).
-  #   stub — deterministic "hold", for testing the pipeline with no API calls.
-  provider: auto
+  # omniroute | auto | openrouter | anthropic | stub
+  #   omniroute — DEFAULT. Self-hosted/private OpenAI-compatible router (unmetered).
+  #   auto      — omniroute if OMNIROUTE_API_KEY is set, else anthropic, else openrouter.
+  #   stub      — deterministic "hold", for testing the pipeline with no API calls.
+  provider: omniroute
   timeout_seconds: 60
   max_tokens: 1024
 
@@ -95,7 +98,8 @@ ai:
   # On model failure / spent budget, use the local strategy instead of "hold".
   local_fallback: true
   # Skip the LLM when nothing material moved since a cycle that held.
-  skip_when_unchanged: true
+  # Set false to not limit or skip AI calls (especially for unmetered OmniRoute).
+  skip_when_unchanged: false
   min_price_move_pct: 0.5
 
   openrouter:
@@ -117,10 +121,12 @@ ai:
   omniroute:
     # Can be overridden per-environment via OMNIROUTE_BASE_URL in .env
     # instead of editing this file (e.g. local vs a remote instance).
-    base_url: http://127.0.0.1:20128/v1   # or https://omni.jacoblevy.co.uk/v1
+    base_url: https://omni.jacoblevy.co.uk/v1
     models:
-      - default
-    model: default   # used only if 'models' is omitted
+      - auto/best-fast
+      - auto/best-reasoning
+      - auto/best-chat
+    model: auto/best-fast   # used only if 'models' is omitted
 
   anthropic:
     model: claude-haiku-4-5
@@ -140,12 +146,14 @@ ai:
 
   # Deterministic fallback advisor. Percent values. One action per cycle:
   # stop-loss -> trend exit -> take-profit -> cautious entry -> hold.
+  # Tuned for short-term/high-turnover micro-trading (tight stop, quick profit
+  # take, and a much lower bar to enter a position).
   local_strategy:
-    stop_loss_pct: 8.0
+    stop_loss_pct: 5.0
     trend_exit: true
-    take_profit_pct: 15.0
-    max_entry_vol_pct: 35.0
-    min_entry_score: 0.35
+    take_profit_pct: 4.0
+    max_entry_vol_pct: 45.0
+    min_entry_score: 0.15
 
 market_data:
   # yahoo — free, no key. Uses the `yahoo` symbol from each watchlist entry.

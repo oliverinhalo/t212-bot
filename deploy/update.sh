@@ -37,6 +37,9 @@ fi
 echo "==> installing/updating dependencies"
 "$APP_DIR/.venv/bin/pip" install --quiet -r "$APP_DIR/requirements.txt"
 
+echo "==> synchronizing environment and configuration"
+"$APP_DIR/.venv/bin/python" -m scripts.sync_config_env
+
 # ------------------------------------------------------------------ sanity
 echo "==> checking config.yaml loads cleanly before touching the service"
 if ! "$APP_DIR/.venv/bin/python" -m t212bot.main --status >/tmp/t212bot-update-status.log 2>&1; then

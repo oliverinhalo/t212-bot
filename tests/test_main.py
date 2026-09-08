@@ -38,6 +38,7 @@ def make_runtime(storage, config=None, ai_response=None):
 _UNIVERSE = [
     Instrument("NVDA_US_EQ", "Nvidia", "NVDA", "US67066G1040", "USD", "STOCK"),
     Instrument("VODl_EQ", "Vodafone", "VOD", "GB00BH4HKS39", "GBX", "STOCK"),
+    Instrument("VUAGl_EQ", "Vanguard S&P 500 Acc", "VUAG", "IE00BFMXXD54", "GBP", "ETF"),
 ]
 
 
@@ -351,6 +352,36 @@ def test_open_universe_prices_a_london_stock_without_fx(storage, tmp_path):
     assert run_cycle(runtime, force=True) == "order:filled"
     quantity, _ = storage.paper_positions()["VODl_EQ"]
     assert quantity == dec("0.142857")  # £10 / £70, floored to 6dp
+
+
+def test_open_universe_falls_back_to_derived_symbol_on_currency_mismatch(storage, tmp_path):
+    # ISIN search returned USD VUAA.L for IE00BFMXXD54, but T212 instrument is in GBP.
+    # SymbolResolver._derive produces VUAG.L which is priced in GBP.
+    config = make_config(mode="paper", enforce_allowlist=False, max_trades_per_day=5)
+    resolver = SymbolResolver(
+        overrides={"VUAGl_EQ": "VUAA.L"},  # Simulated mismatched ISIN result
+        cache_path=tmp_path / "symbol_map.json",
+    )
+    runtime = Runtime(
+        config=config,
+        storage=storage,
+        market=StaticMarketData(
+            {TICKER: dec(10)},
+            symbol_prices={
+                "VUAA.L": (dec("90"), "USD"),   # Mismatched currency
+                "VUAG.L": (dec("75"), "GBP"),   # Derived native symbol
+            },
+        ),
+        ai=StubProvider(response=buy_response(ticker="VUAGl_EQ", notional=10, price=None)),
+        client=None,
+        executor=Executor(config, storage),
+        catalogue=InstrumentCatalogue(_UNIVERSE),
+        fx=None,
+        resolver=resolver,
+    )
+    assert run_cycle(runtime, force=True) == "order:filled"
+    quantity, _ = storage.paper_positions()["VUAGl_EQ"]
+    assert quantity == dec("0.133333")  # £10 / £75, floored to 6dp
 
 
 def test_open_universe_rejects_a_hallucinated_ticker(storage, tmp_path):

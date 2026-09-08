@@ -109,3 +109,36 @@ def test_the_raw_response_round_trips_through_the_shared_parser():
     result = _advise(config, account, snap)
     assert result.raw_response.startswith("{")
     assert result.proposal.action == "sell"  # parsed back out of that JSON
+
+
+def test_an_entry_allows_stacking_when_under_position_cap():
+    config = make_config(max_position_pct=25, max_capital=400, per_trade_cap_pct=2.5, min_order=5)
+    trend = lambda i: 8 + i * 0.02 + math.sin(i / 2) * 0.3
+    rising = {TICKER: _bars(trend), OTHER: _bars(lambda i: 7)}
+    snap = _snapshot({TICKER: 9.1, OTHER: 7}, rising)
+    # Already hold £10 of TICKER (under £100 max position cap)
+    account = make_account(
+        cash=100,
+        positions=[make_position(TICKER, quantity=dec("1.0989"), average_price=dec("9.1"), current_price=dec("9.1"))]
+    )
+
+    result = _advise(config, account, snap, regime="risk_on")
+    assert result.proposal.action == "buy"
+    assert result.proposal.ticker == TICKER
+    assert result.proposal.notional == dec(10)  # 2.5% of 400
+
+
+def test_an_entry_is_blocked_when_position_cap_is_reached():
+    config = make_config(max_position_pct=25, max_capital=400, per_trade_cap_pct=2.5, min_order=5)
+    trend = lambda i: 8 + i * 0.02 + math.sin(i / 2) * 0.3
+    rising = {TICKER: _bars(trend), OTHER: _bars(lambda i: 7)}
+    snap = _snapshot({TICKER: 9.1, OTHER: 7}, rising)
+    # Already hold £100 of TICKER (at £100 max position cap)
+    account = make_account(
+        cash=100,
+        positions=[make_position(TICKER, quantity=dec("10.989"), average_price=dec("9.1"), current_price=dec("9.1"))]
+    )
+
+    result = _advise(config, account, snap, regime="risk_on")
+    assert result.proposal.action == "hold"
+

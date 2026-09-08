@@ -150,7 +150,7 @@ def advise_locally(
         sig
         for ticker, sig in signals.items()
         if ticker in allowed
-        and account.quantity_of(ticker) <= ZERO
+        and (account.value_of(ticker) + config.capital.min_order <= config.position_cap_for(ticker))
         and sig.trend == "bullish"
         and sig.score >= strat.min_entry_score
         and (sig.rsi is None or sig.rsi < Decimal(78))
@@ -161,7 +161,10 @@ def advise_locally(
         return _hold(lines, started, "No instrument meets the entry rules.")
 
     best = max(candidates, key=lambda s: s.score)
-    notional = money(min(spendable, config.capital.per_trade_cap))
+    headroom = config.position_cap_for(best.ticker) - account.value_of(best.ticker)
+    notional = money(min(spendable, config.capital.per_trade_cap, max(ZERO, headroom)))
+    if notional < config.capital.min_order:
+        return _hold(lines, started, "Remaining position headroom or spendable cash below min order.")
     confidence = min(Decimal("0.9"), Decimal("0.6") + Decimal("0.3") * best.score)
     rsi_note = f", RSI {best.rsi:.0f}" if best.rsi is not None else ""
     reasoning = f"Entry: {best.ticker} bullish (score {best.score:+.2f}){rsi_note}."

@@ -96,7 +96,7 @@ class YahooMarketData:
             headers={"User-Agent": "Mozilla/5.0 (compatible; t212-bot/0.1)"},
         )
         self._cache_seconds = cache_seconds
-        self._cache: dict[str, tuple[float, Quote, PriceHistory]] = {}
+        self._cache: dict[tuple[str, str], tuple[float, Quote, PriceHistory]] = {}
 
     def close(self) -> None:
         if self._owns_client:
@@ -127,12 +127,13 @@ class YahooMarketData:
     def fetch_symbol(
         self, ticker: str, yahoo: str, history_days: int
     ) -> tuple[Quote, PriceHistory]:
-        """Quote + daily bars for one instrument, keyed and cached by ``ticker``.
+        """Quote + daily bars for one instrument, keyed and cached by ``(ticker, yahoo)``.
 
         ``ticker`` is what the rest of the codebase uses (the Trading212
         ticker); ``yahoo`` is only the symbol we ask Yahoo for.
         """
-        cached = self._cache.get(ticker)
+        cache_key = (ticker, yahoo)
+        cached = self._cache.get(cache_key)
         if cached and (time.monotonic() - cached[0]) < self._cache_seconds:
             return cached[1], cached[2]
 
@@ -151,7 +152,7 @@ class YahooMarketData:
             raise MarketDataError(f"no data for {yahoo}: {error}")
 
         quote, history = self._parse(ticker, yahoo, result[0], history_days)
-        self._cache[ticker] = (time.monotonic(), quote, history)
+        self._cache[cache_key] = (time.monotonic(), quote, history)
         return quote, history
 
     def _parse(
