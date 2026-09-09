@@ -106,11 +106,15 @@ ai:
 
   # Stop calling OpenRouter after this many HTTP calls in a UTC day (free tier
   # is ~50/day). Past this the local rule-based strategy takes over.
+  # OpenRouter ONLY — OmniRoute (self-hosted, unmetered) and Anthropic
+  # (pay-as-you-go) are never metered by this. 0 means no limit at all.
   daily_request_budget: 45
   # On model failure / spent budget, use the local strategy instead of "hold".
   local_fallback: true
   # Skip the LLM when nothing material moved since a cycle that held.
   # Set false to not limit or skip AI calls (especially for unmetered OmniRoute).
+  # --until-trade ignores this either way: a retry exists because nothing has
+  # changed yet, so the model is asked on every attempt.
   skip_when_unchanged: false
   min_price_move_pct: 0.5
 
