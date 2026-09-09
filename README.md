@@ -144,6 +144,9 @@ further.
 --once              run one cycle and exit
 --dry-run           run a full cycle but never place an order
 --force             run even outside market hours (all other rules still apply)
+--preorder          out of hours, rest a limit order that waits for the open
+                    instead of a market order the broker refuses. Implies
+                    --force; no effect while the market is open
 --until-trade       keep running cycles until one places an order, or the
                     window runs out (default 60 min). Exit 0 if it traded,
                     1 if it never did.
@@ -187,6 +190,50 @@ If it runs the full window and never trades, the audit log says why: check
 `--status` and the `rule` column (`R04_HOLD` means the model kept saying hold;
 `R11_CONFIDENCE`, `R16_BELOW_MIN` and friends mean it proposed something the
 caps refused).
+
+### Buying out of hours (pre-orders)
+
+`--force` will run a cycle at 8pm, but the order it then places is a **market**
+order, and a broker will not accept one for a closed market — the cycle ends in
+a rejection. `--preorder` places a **limit order that rests until the market
+opens** instead:
+
+```bash
+# Decide now, rest the order until the open
+.venv/bin/python -m t212bot.main --once --preorder
+
+# Keep trying to get one queued, for up to an hour
+.venv/bin/python -m t212bot.main --until-trade --preorder
+```
+
+```
+market closed (20:23 is outside 08:05-16:25 Europe/London)
+  — an approved order will be pre-ordered as a GOOD_TILL_CANCEL limit order
+DEMO PRE-ORDER: BUY 0.056100 VUSAl_EQ (~6.00) limit 107.22 GOOD_TILL_CANCEL
+order accepted by broker as 991122 (status=PENDING)
+```
+
+`--preorder` implies `--force` and does nothing while the market is open —
+there is nothing to wait for, so an ordinary order is placed. To make it the
+standing behaviour, set `execution.preorder_when_closed: true`;
+`execution.preorder_time_validity` chooses `GOOD_TILL_CANCEL` (rests into the
+next session) or `DAY`.
+
+The limit price is `execution.limit_offset_bps` away from the last quote, in
+the direction that helps it fill — above the market for a buy, below for a
+sell. That is also the safety property: a market order into an opening gap has
+no ceiling, a limit order does. If the open gaps past your limit the order
+simply does not fill, which is the outcome you want.
+
+Two things worth knowing:
+
+- **The decision is made on a closed-market price.** The order executes at the
+  open, hours later, on whatever the market does overnight. The limit caps the
+  damage; it does not make the decision fresher.
+- **It is a real resting order at the broker.** It is not held locally and not
+  re-checked before it fills. Cancel it in the Trading212 app if you change
+  your mind — the bot's kill switch stops new cycles, not an order already
+  queued.
 
 ---
 

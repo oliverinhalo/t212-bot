@@ -53,6 +53,7 @@ from .models import (
 
 __all__ = [
     "evaluate",
+    "limit_price_for",
     "revalidate",
     "circuit_breaker_state",
     "daily_pnl",
@@ -112,13 +113,24 @@ def floor_quantity(quantity: Decimal, config: AppConfig) -> Decimal:
     return quantity.quantize(step, rounding=ROUND_FLOOR)
 
 
-def _limit_price(side: str, price: Decimal, config: AppConfig) -> Decimal | None:
-    """Limit price offset in the direction that helps the order fill."""
-    if config.execution.order_type != "limit":
-        return None
+def limit_price_for(side: str, price: Decimal, config: AppConfig) -> Decimal:
+    """A limit price offset in the direction that helps the order fill.
+
+    Above the market for a buy, below it for a sell, by
+    ``execution.limit_offset_bps``. Always computed, whatever the configured
+    order type: an out-of-hours pre-order needs one even when the bot is
+    otherwise placing market orders.
+    """
     offset = price * config.execution.limit_offset_bps / Decimal(10_000)
     raw = price + offset if side == "buy" else price - offset
     return money(max(raw, Decimal("0.01")))
+
+
+def _limit_price(side: str, price: Decimal, config: AppConfig) -> Decimal | None:
+    """The verdict's limit price: set only when limit orders are configured."""
+    if config.execution.order_type != "limit":
+        return None
+    return limit_price_for(side, price, config)
 
 
 def _assert_not_enlarged(proposal: Proposal, verdict: Verdict, price: Decimal) -> Verdict:

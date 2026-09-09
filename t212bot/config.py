@@ -82,6 +82,11 @@ class RiskConfig:
         return -(max_capital * self.daily_loss_limit_pct / Decimal(100))
 
 
+# Order lifetimes the broker understands. DAY dies at the end of the session;
+# GOOD_TILL_CANCEL rests until it fills or is pulled.
+TIME_VALIDITIES = ("DAY", "GOOD_TILL_CANCEL")
+
+
 @dataclass(frozen=True)
 class ExecutionConfig:
     order_type: str
@@ -90,6 +95,11 @@ class ExecutionConfig:
     quantity_decimals: int
     fractional: bool
     max_decision_age_seconds: int
+    # When the market is closed, place a resting limit order instead of a
+    # market order the broker would simply refuse — a pre-order that waits for
+    # the open. The limit price caps what a gap at the open can cost you.
+    preorder_when_closed: bool = False
+    preorder_time_validity: str = "GOOD_TILL_CANCEL"
 
 
 @dataclass(frozen=True)
@@ -486,6 +496,14 @@ def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env"
     quantity_decimals = _int(exec_raw, "quantity_decimals", "execution", 6)
     if not (0 <= quantity_decimals <= 12):
         raise ConfigError("execution.quantity_decimals must be between 0 and 12")
+    time_validity = str(
+        exec_raw.get("preorder_time_validity", "GOOD_TILL_CANCEL")
+    ).strip().upper()
+    if time_validity not in TIME_VALIDITIES:
+        raise ConfigError(
+            "execution.preorder_time_validity must be one of "
+            f"{'|'.join(TIME_VALIDITIES)} (got {time_validity!r})"
+        )
     execution = ExecutionConfig(
         order_type=order_type,
         limit_offset_bps=_dec(exec_raw, "limit_offset_bps", "execution", 25),
@@ -493,6 +511,8 @@ def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env"
         quantity_decimals=quantity_decimals,
         fractional=bool(exec_raw.get("fractional", True)),
         max_decision_age_seconds=_int(exec_raw, "max_decision_age_seconds", "execution", 120),
+        preorder_when_closed=bool(exec_raw.get("preorder_when_closed", False)),
+        preorder_time_validity=time_validity,
     )
 
     sched_raw = _section(data, "schedule")

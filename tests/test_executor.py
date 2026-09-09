@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import date
 from decimal import Decimal
@@ -63,7 +64,7 @@ class FakeClient:
         return self._response
 
     def place_limit_order(self, ticker, quantity, limit_price, time_validity="DAY"):
-        self.calls.append(("limit", ticker, quantity, limit_price))
+        self.calls.append(("limit", ticker, quantity, limit_price, time_validity))
         if self._raises:
             raise self._raises
         return self._response
@@ -295,6 +296,97 @@ def test_limit_orders_are_routed_to_the_limit_endpoint(storage):
 
 
 # --------------------------------------------------------------------------- #
+# Out-of-hours pre-orders
+# --------------------------------------------------------------------------- #
+
+
+def test_a_preorder_rests_a_limit_order_instead_of_a_market_order(storage):
+    # order_type is "market", but the market is shut: a market order would be
+    # refused, so it goes out as a limit order that waits for the open.
+    config = make_config(mode="demo", order_type="market")
+    client = FakeClient(response={"id": 7, "status": "PENDING"})
+    executor = Executor(config, storage, client)
+
+    record = executor.execute(
+        "d1", buy_verdict(), DAY, lambda: make_account(cash=50), preorder=True
+    )
+
+    kind, ticker, quantity, limit_price, validity = client.calls[0]
+    assert kind == "limit"
+    assert ticker == TICKER
+    assert quantity == dec(1)
+    # 25 bps above the £10 reference, in the direction that helps a buy fill.
+    assert limit_price == dec("10.03")
+    assert validity == "GOOD_TILL_CANCEL"
+    assert record.state == STATE_ACCEPTED
+
+
+def test_a_preorder_to_sell_rests_below_the_market(storage):
+    config = make_config(mode="demo", order_type="market")
+    client = FakeClient(response={"id": 8, "status": "PENDING"})
+    executor = Executor(config, storage, client)
+
+    executor.execute(
+        "d1",
+        sell_verdict(),
+        DAY,
+        lambda: make_account(cash=50, positions=[make_position(quantity=5)]),
+        preorder=True,
+    )
+
+    assert client.calls[0][3] == dec("9.98")
+
+
+def test_a_preorder_honours_the_configured_time_validity(storage):
+    config = make_config(mode="demo", preorder_time_validity="DAY")
+    client = FakeClient(response={"id": 9, "status": "PENDING"})
+    executor = Executor(config, storage, client)
+
+    executor.execute("d1", buy_verdict(), DAY, lambda: make_account(cash=50), preorder=True)
+
+    assert client.calls[0][4] == "DAY"
+
+
+def test_without_the_preorder_flag_the_order_stays_a_market_order(storage):
+    config = make_config(mode="demo", order_type="market")
+    client = FakeClient()
+    executor = Executor(config, storage, client)
+
+    executor.execute("d1", buy_verdict(), DAY, lambda: make_account(cash=50))
+
+    assert client.calls[0][0] == "market"
+
+
+def test_a_preorder_still_goes_through_the_pre_submit_recheck(storage):
+    # The pre-order path changes how an order is placed, never whether it may
+    # be placed: no cash, no order, market shut or not.
+    config = make_config(mode="demo")
+    client = FakeClient()
+    executor = Executor(config, storage, client)
+
+    record = executor.execute(
+        "d1", buy_verdict(), DAY, lambda: make_account(cash=0), preorder=True
+    )
+
+    assert record.state == STATE_CANCELLED
+    assert client.calls == []
+
+
+def test_a_paper_preorder_fills_but_says_so_in_the_audit_log(storage):
+    config = make_config(mode="paper")
+    storage.seed_paper_account(dec(50))
+    executor = Executor(config, storage)
+
+    record = executor.execute(
+        "d1", buy_verdict(), DAY, lambda: make_account(cash=50), preorder=True
+    )
+
+    assert record.state == STATE_FILLED
+    row = storage._read_one("SELECT raw_response FROM orders WHERE decision_id = ?", ("d1",))
+    assert json.loads(row["raw_response"])["preorder"] is True
+
+
+# --------------------------------------------------------------------------- #
 # Construction
 # --------------------------------------------------------------------------- #
 
@@ -306,3 +398,18 @@ def test_live_mode_requires_a_client(storage):
 
 def test_paper_mode_needs_no_client(storage):
     assert Executor(make_config(mode="paper"), storage, None) is not None
+
+
+def test_an_auth_refusal_is_a_rejection_not_an_unknown_outcome(storage):
+    # 401/403 is refused before an order can exist. Recording it as unknown
+    # would block every later cycle over a credentials mistake.
+    from t212bot.t212_client import T212AuthError
+
+    config = make_config(mode="demo")
+    client = FakeClient(raises=T212AuthError("403 from /equity/orders/market"))
+    executor = Executor(config, storage, client)
+
+    record = executor.execute("d1", buy_verdict(), DAY, lambda: make_account(cash=50))
+
+    assert record.state == STATE_REJECTED
+    assert storage.unresolved_orders() == []

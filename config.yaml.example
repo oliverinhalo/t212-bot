@@ -68,6 +68,17 @@ execution:
   # Assumed adverse slippage when simulating a fill in paper mode.
   paper_slippage_bps: 10
 
+  # When the market is closed, place a resting LIMIT order that waits for the
+  # open instead of a market order the broker simply refuses. The limit sits
+  # limit_offset_bps away from the last quote in the direction that helps it
+  # fill, which also caps what an opening gap can cost you: a buy will not pay
+  # above the limit, it just does not fill.
+  # The --preorder CLI flag turns this on for one run without editing this file.
+  preorder_when_closed: false
+  # How long a pre-order rests at the broker: GOOD_TILL_CANCEL or DAY.
+  # GOOD_TILL_CANCEL survives to the next session; DAY expires with today's.
+  preorder_time_validity: GOOD_TILL_CANCEL
+
   # Order quantities are rounded DOWN to this many decimal places, so rounding
   # can only ever shrink an order. Set fractional: false for whole shares only.
   quantity_decimals: 6

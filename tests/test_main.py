@@ -505,3 +505,67 @@ def test_until_trade_treats_an_approved_dry_run_as_the_answer(storage):
     assert traded
     assert status == "dry-run"
     assert storage.paper_positions() == {}
+
+
+# --------------------------------------------------------------------------- #
+# Out-of-hours pre-orders
+# --------------------------------------------------------------------------- #
+
+
+def _window(config, *, open_now: bool):
+    """A config whose trading window is deterministically open or shut."""
+    from dataclasses import replace
+
+    schedule = replace(
+        config.schedule,
+        market_open="00:00" if open_now else "00:00",
+        market_close="23:59" if open_now else "00:00",
+        trading_days=("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+        if open_now
+        else ("nev",),
+    )
+    return replace(config, schedule=schedule)
+
+
+def _preorder_flag(storage, decision_id="d1"):
+    row = storage._read_one(
+        "SELECT raw_response FROM orders WHERE decision_id = ?", (decision_id,)
+    )
+    return json.loads(row["raw_response"]).get("preorder")
+
+
+def test_a_closed_market_preorders_when_asked(storage):
+    config = _window(make_config(mode="paper"), open_now=False)
+    runtime = make_runtime(storage, config, ai_response=buy_response())
+
+    assert run_cycle(runtime, force=True, preorder=True) == "order:filled"
+    order = storage.orders_today(trading_day(config))[0]
+    assert _preorder_flag(storage, order.decision_id) is True
+
+
+def test_an_open_market_places_an_ordinary_order_even_with_preorder_asked(storage):
+    # Nothing to wait for: the pre-order path is for a shut market only.
+    config = _window(make_config(mode="paper"), open_now=True)
+    runtime = make_runtime(storage, config, ai_response=buy_response())
+
+    assert run_cycle(runtime, force=True, preorder=True) == "order:filled"
+    order = storage.orders_today(trading_day(config))[0]
+    assert _preorder_flag(storage, order.decision_id) is None
+
+
+def test_preorder_when_closed_config_needs_no_flag(storage):
+    config = _window(make_config(mode="paper", preorder_when_closed=True), open_now=False)
+    runtime = make_runtime(storage, config, ai_response=buy_response())
+
+    assert run_cycle(runtime, force=True) == "order:filled"
+    order = storage.orders_today(trading_day(config))[0]
+    assert _preorder_flag(storage, order.decision_id) is True
+
+
+def test_a_closed_market_without_preorder_places_an_ordinary_order(storage):
+    config = _window(make_config(mode="paper"), open_now=False)
+    runtime = make_runtime(storage, config, ai_response=buy_response())
+
+    assert run_cycle(runtime, force=True) == "order:filled"
+    order = storage.orders_today(trading_day(config))[0]
+    assert _preorder_flag(storage, order.decision_id) is None

@@ -56,6 +56,8 @@ def make_config(
     min_confidence: str | float = "0.6",
     enforce_allowlist: bool = True,
     order_type: str = "market",
+    preorder_when_closed: bool = False,
+    preorder_time_validity: str = "GOOD_TILL_CANCEL",
     quantity_decimals: int = 6,
     fractional: bool = True,
     paper_slippage_bps: str | float = 0,
@@ -86,6 +88,8 @@ def make_config(
             quantity_decimals=quantity_decimals,
             fractional=fractional,
             max_decision_age_seconds=120,
+            preorder_when_closed=preorder_when_closed,
+            preorder_time_validity=preorder_time_validity,
         ),
         schedule=ScheduleConfig(
             cron="0,30 8-16 * * mon-fri",
