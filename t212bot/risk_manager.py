@@ -133,6 +133,23 @@ def _limit_price(side: str, price: Decimal, config: AppConfig) -> Decimal | None
     return limit_price_for(side, price, config)
 
 
+def _below_min_order(notional: Decimal, config: AppConfig) -> bool:
+    """Is this order under ``capital.min_order_gbp``, judged in whole pence?
+
+    Quantities are floored to ``execution.quantity_decimals``, so an order
+    sized to exactly the minimum can land a fraction of a penny under it: £5.00
+    of a £109.00 share is 0.045871 shares once floored, worth £4.999939. The
+    strict comparison rejected that and then reported it as "partial sell of
+    5.00 is below the 5.00 minimum order", because both figures are shown
+    rounded to pence.
+
+    The minimum is a rule about money, and money here is pence, so compare at
+    the resolution the rule is written in — and the same one the audit log
+    reports. Anything genuinely below the minimum is still refused.
+    """
+    return money(notional) < money(config.capital.min_order)
+
+
 def _assert_not_enlarged(proposal: Proposal, verdict: Verdict, price: Decimal) -> Verdict:
     """Last line of defence: a verdict may never exceed what was proposed.
 
@@ -326,7 +343,7 @@ def _size_buy(
         )
 
     notional = quantity * price
-    if notional < config.capital.min_order:
+    if _below_min_order(notional, config):
         return reject(
             "R16_BELOW_MIN",
             f"rounded order {money(notional)} ({quantity} x {price}) is below the "
@@ -403,7 +420,7 @@ def _size_sell(
     notional = quantity * price
     # A full exit is always allowed through, even if the holding is worth less
     # than min_order — otherwise dust positions could never be closed.
-    if notional < config.capital.min_order and not full_exit:
+    if _below_min_order(notional, config) and not full_exit:
         return reject(
             "R16_BELOW_MIN",
             f"partial sell of {money(notional)} is below the "
@@ -567,7 +584,7 @@ def revalidate(verdict: Verdict, account: AccountState, config: AppConfig) -> Ve
 
         quantity = floor_quantity(spendable / price, config)
         notional = quantity * price
-        if quantity <= ZERO or notional < config.capital.min_order:
+        if quantity <= ZERO or _below_min_order(notional, config):
             return reject(
                 "R16_BELOW_MIN",
                 f"balance re-check at submission: only {money(spendable)} available, "
