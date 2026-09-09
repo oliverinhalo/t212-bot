@@ -23,6 +23,7 @@ two separate environment variables.**
 - [The circuit breaker](#the-circuit-breaker)
 - [Unresolved orders](#unresolved-orders)
 - [Configuration](#configuration)
+- [Making it actually trade](#making-it-actually-trade)
 - [The audit log](#the-audit-log)
 - [The dashboard](#the-dashboard)
 - [Running as a service](#running-as-a-service)
@@ -83,7 +84,7 @@ the audit log, and each is asserted in `tests/test_risk_manager.py`.
 | 5 | **Trade-frequency cap.** `max_trades_per_day` (default 5), counting attempts, not fills | `R10_FREQUENCY` | `risk_manager.evaluate` |
 | 6 | **Ticker allow-list.** With `risk.enforce_allowlist: true` (default) the AI can only act on watch-list tickers. With it `false` (open-universe) the AI may name any instrument, but it must resolve against the Trading212 catalogue — a hallucinated ticker is still rejected before the broker | `R05_ALLOWLIST` | `risk_manager.evaluate` |
 | 7 | **No leverage, no shorting, no options.** Structurally: the client has no method that could express one, and a sell is clamped to the quantity actually held | `R18_NO_POSITION` | `t212_client`, `risk_manager._size_sell` |
-| 8 | **Every proposal is sanity-checked.** Unknown ticker, missing/stale/zero quote, implied price far from the market, low confidence, or any cap breach → rejected or shrunk | `R05`–`R17` | `risk_manager.evaluate` |
+| 8 | **Every proposal is sanity-checked.** Unknown ticker, missing/stale/zero quote, implied price far from the market, low confidence, or any cap breach → rejected or shrunk | `R05`–`R19` | `risk_manager.evaluate` |
 | 9 | **Duplicate-order guard.** One decision id claims at most one order row, written to SQLite *before* the HTTP call. Survives retries and crashes | `R03_DUPLICATE` | `storage.reserve_order` |
 | 10 | **Kill switch.** A `STOP` file halts every cycle cleanly | — | `main.run_cycle` |
 | 11 | **Full audit log.** Snapshot, prompt, raw response, verdict, reasoning, order and fill — all in SQLite | — | `storage.py` |
@@ -143,6 +144,14 @@ further.
 --once              run one cycle and exit
 --dry-run           run a full cycle but never place an order
 --force             run even outside market hours (all other rules still apply)
+--preorder          out of hours, rest a limit order that waits for the open
+                    instead of a market order the broker refuses. Implies
+                    --force; no effect while the market is open
+--until-trade       keep running cycles until one places an order, or the
+                    window runs out (default 60 min). Exit 0 if it traded,
+                    1 if it never did.
+--until-trade-minutes N   how long to keep trying (default 60)
+--retry-seconds N         wait between attempts (default 60)
 --status            current mode, caps, breaker, unresolved orders, today's P&L
 --list-unresolved   orders needing manual reconciliation
 --resolve-order ID  mark one reconciled (with --note "what you found")
@@ -151,6 +160,80 @@ further.
 ```
 
 With no flags it starts the scheduler and runs on the configured cron.
+
+### Keep trying until it trades
+
+```bash
+# One attempt, right now, market hours ignored
+.venv/bin/python -m t212bot.main --once --force
+
+# Keep attempting for up to an hour, one attempt a minute
+.venv/bin/python -m t212bot.main --until-trade --force
+
+# Same, but 30 minutes at 15-second intervals
+.venv/bin/python -m t212bot.main --until-trade --force \
+    --until-trade-minutes 30 --retry-seconds 15
+
+# "Would it trade?" — approves and stops, places nothing
+.venv/bin/python -m t212bot.main --until-trade --force --dry-run
+```
+
+`--until-trade` re-runs the ordinary cycle. It grants no extra permission:
+every attempt goes through the same risk manager, and a run that ends without
+an order means the bot never had a proposal it was willing to act on. It stops
+early — without waiting out the window — on anything a retry cannot clear: the
+kill switch, a tripped breaker, or an unresolved order. Because retries happen
+precisely when nothing has changed, they bypass `ai.skip_when_unchanged` and
+ask the model every attempt.
+
+If it runs the full window and never trades, the audit log says why: check
+`--status` and the `rule` column (`R04_HOLD` means the model kept saying hold;
+`R11_CONFIDENCE`, `R16_BELOW_MIN` and friends mean it proposed something the
+caps refused).
+
+### Buying out of hours (pre-orders)
+
+`--force` will run a cycle at 8pm, but the order it then places is a **market**
+order, and a broker will not accept one for a closed market — the cycle ends in
+a rejection. `--preorder` places a **limit order that rests until the market
+opens** instead:
+
+```bash
+# Decide now, rest the order until the open
+.venv/bin/python -m t212bot.main --once --preorder
+
+# Keep trying to get one queued, for up to an hour
+.venv/bin/python -m t212bot.main --until-trade --preorder
+```
+
+```
+market closed (20:23 is outside 08:05-16:25 Europe/London)
+  — an approved order will be pre-ordered as a GOOD_TILL_CANCEL limit order
+DEMO PRE-ORDER: BUY 0.056100 VUSAl_EQ (~6.00) limit 107.22 GOOD_TILL_CANCEL
+order accepted by broker as 991122 (status=PENDING)
+```
+
+`--preorder` implies `--force` and does nothing while the market is open —
+there is nothing to wait for, so an ordinary order is placed. To make it the
+standing behaviour, set `execution.preorder_when_closed: true`;
+`execution.preorder_time_validity` chooses `GOOD_TILL_CANCEL` (rests into the
+next session) or `DAY`.
+
+The limit price is `execution.limit_offset_bps` away from the last quote, in
+the direction that helps it fill — above the market for a buy, below for a
+sell. That is also the safety property: a market order into an opening gap has
+no ceiling, a limit order does. If the open gaps past your limit the order
+simply does not fill, which is the outcome you want.
+
+Two things worth knowing:
+
+- **The decision is made on a closed-market price.** The order executes at the
+  open, hours later, on whatever the market does overnight. The limit caps the
+  damage; it does not make the decision fresher.
+- **It is a real resting order at the broker.** It is not held locally and not
+  re-checked before it fills. Cancel it in the Trading212 app if you change
+  your mind — the bot's kill switch stops new cycles, not an order already
+  queued.
 
 ---
 
@@ -279,7 +362,8 @@ Key caps, with their defaults for £50 of capital:
 | `risk.daily_loss_limit_pct` | 10% | Breaker at −£5 |
 | `risk.max_trades_per_day` | 5 | Attempts, not fills |
 | `risk.max_price_deviation_pct` | 2% | AI's implied price vs the quote |
-| `risk.max_quote_age_seconds` | 900 | Older quotes block all trading |
+| `risk.max_quote_age_seconds` | 900 | How long ago *we* fetched the quote; 0 disables |
+| `risk.max_quote_delay_seconds` | 0 (off) | How far behind the exchange the feed's own timestamp may be |
 | `risk.min_confidence` | 0.60 | Below this, treated as hold |
 | `execution.quantity_decimals` | 6 | Quantities always round **down** |
 
@@ -310,7 +394,7 @@ day in SQLite (`ai_usage`). Three things keep the bot under the cap:
 
 | Mechanism | Config | Effect |
 |---|---|---|
-| Daily budget | `ai.daily_request_budget` (45) | Past this, the **local strategy** runs instead of the model for the rest of the day |
+| Daily budget | `ai.daily_request_budget` (45) | **OpenRouter only.** Past this, the **local strategy** runs instead of the model for the rest of the day. `0` means no limit. OmniRoute (self-hosted, unmetered) and Anthropic (pay-as-you-go) are never metered by it |
 | Cache skip | `ai.skip_when_unchanged` (true) | If nothing moved more than `ai.min_price_move_pct` since a cycle that held, the model is not called at all |
 | Local fallback | `ai.local_fallback` (true) | A model failure or refusal falls back to the local strategy, not a blind `hold` |
 
@@ -326,6 +410,46 @@ emits the same JSON contract as the model and its proposal goes through the
 
 A provider failure with local fallback disabled still degrades to `hold`, with
 the error recorded. Nothing here ever crashes the cycle or trades on a guess.
+
+---
+
+## Making it actually trade
+
+A bot that holds every cycle is usually not broken — some gate is refusing, and
+the audit log names which one. Diagnose before loosening:
+
+```bash
+# What did it decide, and which rule stopped it?
+.venv/bin/python -m t212bot.main --status
+sqlite3 data/t212bot.sqlite3 \
+  "SELECT created_at, ai_action, ai_ticker, rule, reason FROM decisions ORDER BY id DESC LIMIT 20;"
+```
+
+Then loosen the knob that matches the rule you actually see. Each row costs you
+the protection in the last column — that is the trade, not a free win.
+
+| Symptom (`rule`) | Config change | What it costs |
+|---|---|---|
+| `R04_HOLD` every cycle | `ai.skip_when_unchanged: false`, and check `ai.provider` is really answering (`--once --force` and read the log) | More API calls |
+| `R11_CONFIDENCE` | Lower `risk.min_confidence` (e.g. `0.10`) | Acts on weaker convictions |
+| `R16_BELOW_MIN` | Lower `capital.min_order_gbp` (e.g. `1.00`) | More dust-sized orders, fees bite harder |
+| `R09_PRICE_DEVIATION` | Raise `risk.max_price_deviation_pct` (e.g. `5.0`) | Weaker guard against a hallucinated or stale price |
+| `R15_POSITION_CAP` | Raise `capital.max_position_pct` | Less diversification, more single-ticker exposure |
+| `R14_CAPITAL_CAP` | Raise `capital.max_capital_gbp` | More money at risk. The one knob that changes your real downside |
+| `R10_FREQUENCY` | Raise `risk.max_trades_per_day` | More trading, more fees |
+| `R13_NO_CASH` | Lower `capital.cash_buffer_gbp` | A slipped fill can overdraw |
+| `R05_ALLOWLIST` / nothing to buy | `risk.enforce_allowlist: false` (run `python -m scripts.list_instruments --refresh` first) | The AI may name anything on Trading212, including things you have never looked at |
+| `skipped: market closed` | Widen `schedule.market_open`/`market_close`/`trading_days`, or pass `--force` | Trading on a delayed or closed-market price |
+| Cycles too rare | `schedule.cron` (e.g. `*/15 8-16 * * mon-fri`) | More API calls, more chances to trade |
+
+Sizing is bracketed by `capital.min_order_gbp` and `per_trade_cap_pct` × 
+`max_capital_gbp`. If the minimum is above the per-trade cap the config is
+rejected at load; if they are close, most proposals land outside the band and
+get refused, which reads as "it never trades". Widening that band is usually
+the single most effective change.
+
+Do this in paper mode first, then demo, and read the audit log before letting
+any of it near `MODE=live`.
 
 ---
 
@@ -459,9 +583,16 @@ Worth knowing before you trust this with money.
 - **Pence vs pounds.** London-listed ETFs quote in pence (`GBp`). The market
   data layer converts to GBP explicitly; getting this wrong would be a
   factor-of-100 error in every cap.
-- **Quote freshness is a trading gate.** With `max_quote_age_seconds: 900`, a
-  stale quote blocks all trading (`R07_QUOTE_STALE`). Outside market hours,
-  quotes go stale and nothing trades even with `--force`. That is intentional.
+- **Quote freshness is a trading gate, but feed delay is not.** These are two
+  different clocks and conflating them used to block every order.
+  `max_quote_age_seconds` measures how long ago *the bot fetched* the quote —
+  it catches our own market data stalling (`R07_QUOTE_STALE`).
+  `max_quote_delay_seconds` measures how far behind the exchange the feed's own
+  timestamp is; Yahoo is delayed ~15 minutes, so a quote pulled a second ago is
+  permanently ~900s "old" by that measure. It is off (`0`) by default — set it
+  to `900` to refuse to trade on a delayed feed (`R19_QUOTE_DELAYED`). Either
+  limit is disabled with `0`. Trading outside market hours is gated separately,
+  by `schedule.market_open`/`market_close`.
 - **Endpoint paths** follow the documented `/api/v0/equity/...` shapes. Verify
   against demo before live; `check_auth` exercises the account and portfolio
   endpoints, and a `--once` demo cycle exercises the order path.

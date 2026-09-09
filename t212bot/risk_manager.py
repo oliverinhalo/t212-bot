@@ -18,7 +18,7 @@ Rule codes (also written to the audit log, so keep them stable):
   R04_HOLD             the AI said hold, or proposed nothing actionable
   R05_ALLOWLIST        ticker is not on the configured allow-list
   R06_QUOTE_MISSING    no quote for the ticker
-  R07_QUOTE_STALE      quote older than risk.max_quote_age_seconds
+  R07_QUOTE_STALE      quote fetched longer ago than risk.max_quote_age_seconds
   R08_QUOTE_INVALID    quote price is zero or negative
   R09_PRICE_DEVIATION  AI's implied price is far from the last quote
   R10_FREQUENCY        already hit risk.max_trades_per_day
@@ -30,6 +30,7 @@ Rule codes (also written to the audit log, so keep them stable):
   R16_BELOW_MIN        approvable size is under capital.min_order_gbp
   R17_QUANTITY_ZERO    size rounds down to zero shares
   R18_NO_POSITION      sell with nothing held (this is also the no-shorting rule)
+  R19_QUOTE_DELAYED    feed's own delay exceeds risk.max_quote_delay_seconds
   OK                   approved
 """
 
@@ -52,6 +53,7 @@ from .models import (
 
 __all__ = [
     "evaluate",
+    "limit_price_for",
     "revalidate",
     "circuit_breaker_state",
     "daily_pnl",
@@ -111,13 +113,41 @@ def floor_quantity(quantity: Decimal, config: AppConfig) -> Decimal:
     return quantity.quantize(step, rounding=ROUND_FLOOR)
 
 
-def _limit_price(side: str, price: Decimal, config: AppConfig) -> Decimal | None:
-    """Limit price offset in the direction that helps the order fill."""
-    if config.execution.order_type != "limit":
-        return None
+def limit_price_for(side: str, price: Decimal, config: AppConfig) -> Decimal:
+    """A limit price offset in the direction that helps the order fill.
+
+    Above the market for a buy, below it for a sell, by
+    ``execution.limit_offset_bps``. Always computed, whatever the configured
+    order type: an out-of-hours pre-order needs one even when the bot is
+    otherwise placing market orders.
+    """
     offset = price * config.execution.limit_offset_bps / Decimal(10_000)
     raw = price + offset if side == "buy" else price - offset
     return money(max(raw, Decimal("0.01")))
+
+
+def _limit_price(side: str, price: Decimal, config: AppConfig) -> Decimal | None:
+    """The verdict's limit price: set only when limit orders are configured."""
+    if config.execution.order_type != "limit":
+        return None
+    return limit_price_for(side, price, config)
+
+
+def _below_min_order(notional: Decimal, config: AppConfig) -> bool:
+    """Is this order under ``capital.min_order_gbp``, judged in whole pence?
+
+    Quantities are floored to ``execution.quantity_decimals``, so an order
+    sized to exactly the minimum can land a fraction of a penny under it: £5.00
+    of a £109.00 share is 0.045871 shares once floored, worth £4.999939. The
+    strict comparison rejected that and then reported it as "partial sell of
+    5.00 is below the 5.00 minimum order", because both figures are shown
+    rounded to pence.
+
+    The minimum is a rule about money, and money here is pence, so compare at
+    the resolution the rule is written in — and the same one the audit log
+    reports. Anything genuinely below the minimum is still refused.
+    """
+    return money(notional) < money(config.capital.min_order)
 
 
 def _assert_not_enlarged(proposal: Proposal, verdict: Verdict, price: Decimal) -> Verdict:
@@ -163,14 +193,37 @@ def _check_quote(ticker: str, inputs: RiskInputs, config: AppConfig) -> Verdict 
         return reject(
             "R08_QUOTE_INVALID", f"quote price for {ticker} is {quote.price}", ticker=ticker
         )
-    age = quote.age_seconds(inputs.now)
-    if age > config.risk.max_quote_age_seconds:
-        return reject(
-            "R07_QUOTE_STALE",
-            f"quote for {ticker} is {age:.0f}s old, limit is "
-            f"{config.risk.max_quote_age_seconds}s",
-            ticker=ticker,
-        )
+    # Two different things can be wrong with a quote's timing, and conflating
+    # them is what used to block every trade on a delayed feed:
+    #
+    #   staleness — how long ago *we* fetched it. This is the one that matters:
+    #               it says our own market data has stopped updating.
+    #   delay     — how far behind the exchange timestamp is. On a free feed
+    #               this is a constant ~15 minutes and says nothing about
+    #               whether our data is current, so it is gated separately and
+    #               is off by default.
+    #
+    # Either limit is disabled by setting it to 0 or less.
+    max_age = config.risk.max_quote_age_seconds
+    if max_age > 0:
+        staleness = quote.staleness_seconds(inputs.now)
+        if staleness > max_age:
+            return reject(
+                "R07_QUOTE_STALE",
+                f"quote for {ticker} was fetched {staleness:.0f}s ago, limit is {max_age}s",
+                ticker=ticker,
+            )
+
+    max_delay = config.risk.max_quote_delay_seconds
+    if max_delay > 0:
+        delay = quote.age_seconds(inputs.now)
+        if delay > max_delay:
+            return reject(
+                "R19_QUOTE_DELAYED",
+                f"quote for {ticker} is timestamped {delay:.0f}s behind the market, "
+                f"limit is {max_delay}s",
+                ticker=ticker,
+            )
     return quote
 
 
@@ -290,7 +343,7 @@ def _size_buy(
         )
 
     notional = quantity * price
-    if notional < config.capital.min_order:
+    if _below_min_order(notional, config):
         return reject(
             "R16_BELOW_MIN",
             f"rounded order {money(notional)} ({quantity} x {price}) is below the "
@@ -367,7 +420,7 @@ def _size_sell(
     notional = quantity * price
     # A full exit is always allowed through, even if the holding is worth less
     # than min_order — otherwise dust positions could never be closed.
-    if notional < config.capital.min_order and not full_exit:
+    if _below_min_order(notional, config) and not full_exit:
         return reject(
             "R16_BELOW_MIN",
             f"partial sell of {money(notional)} is below the "
@@ -531,7 +584,7 @@ def revalidate(verdict: Verdict, account: AccountState, config: AppConfig) -> Ve
 
         quantity = floor_quantity(spendable / price, config)
         notional = quantity * price
-        if quantity <= ZERO or notional < config.capital.min_order:
+        if quantity <= ZERO or _below_min_order(notional, config):
             return reject(
                 "R16_BELOW_MIN",
                 f"balance re-check at submission: only {money(spendable)} available, "

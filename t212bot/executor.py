@@ -26,7 +26,7 @@ from typing import Callable
 
 from .config import AppConfig
 from .models import AccountState, OrderRecord, Verdict, ZERO, maybe_dec, money
-from .risk_manager import revalidate
+from .risk_manager import limit_price_for, revalidate
 from .storage import (
     STATE_ACCEPTED,
     STATE_CANCELLED,
@@ -35,7 +35,13 @@ from .storage import (
     STATE_UNKNOWN,
     Storage,
 )
-from .t212_client import T212APIError, T212Client, T212Error, T212TransportError
+from .t212_client import (
+    T212APIError,
+    T212AuthError,
+    T212Client,
+    T212Error,
+    T212TransportError,
+)
 
 log = logging.getLogger(__name__)
 
@@ -64,8 +70,16 @@ class Executor:
         verdict: Verdict,
         trading_day: date,
         refresh_account: Callable[[], AccountState],
+        preorder: bool = False,
     ) -> OrderRecord | None:
-        """Place the approved order, or return None if it never reached the market."""
+        """Place the approved order, or return None if it never reached the market.
+
+        ``preorder`` says the market is closed and the order should rest until
+        it opens: a limit order with the configured time validity, rather than
+        a market order the broker would refuse outright. It changes how the
+        order is placed, never whether it is allowed — the risk manager has
+        already decided that, and the pre-submit re-check below still runs.
+        """
         if not verdict.approved or verdict.ticker is None:
             return None
 
@@ -114,11 +128,17 @@ class Executor:
         # 3. Submit.
         self.storage.mark_submitting(decision_id)
         if self.config.mode == "paper":
-            return self._simulate(decision_id, checked, trading_day)
-        return self._submit(decision_id, checked)
+            return self._simulate(decision_id, checked, trading_day, preorder=preorder)
+        return self._submit(decision_id, checked, preorder=preorder)
 
     # ----------------------------------------------------------------- paper
-    def _simulate(self, decision_id: str, verdict: Verdict, trading_day: date) -> OrderRecord:
+    def _simulate(
+        self,
+        decision_id: str,
+        verdict: Verdict,
+        trading_day: date,
+        preorder: bool = False,
+    ) -> OrderRecord:
         price = verdict.reference_price
         if price is None or price <= ZERO:  # pragma: no cover - blocked upstream
             raise ExecutionError("cannot simulate a fill without a reference price")
@@ -156,7 +176,14 @@ class Executor:
             broker_order_id=f"paper-{decision_id[:8]}",
             fill_price=fill_price,
             fill_quantity=quantity,
-            raw_response={"simulated": True, "realised_pnl": str(realised)},
+            raw_response={
+                "simulated": True,
+                "realised_pnl": str(realised),
+                # The paper ledger has no concept of a resting order, so this
+                # fills straight away. Recording the flag keeps the audit log
+                # honest about what a live run would have done instead.
+                **({"preorder": True} if preorder else {}),
+            },
         )
         log.info(
             "PAPER fill: %s %s at %s (%s), realised %s",
@@ -169,23 +196,40 @@ class Executor:
         return self.storage.get_order(decision_id)
 
     # ------------------------------------------------------------ demo / live
-    def _submit(self, decision_id: str, verdict: Verdict) -> OrderRecord:
+    def _submit(
+        self, decision_id: str, verdict: Verdict, preorder: bool = False
+    ) -> OrderRecord:
         assert self.client is not None  # guaranteed by __init__
         ticker = verdict.ticker
         quantity = verdict.quantity  # already signed: negative sells
+        limit_price = self._preorder_limit_price(verdict) if preorder else None
 
         log.warning(
-            "%s ORDER: %s %s %s (~%s) decision=%s",
+            "%s %s: %s %s %s (~%s) decision=%s%s",
             self.config.mode.upper(),
+            "PRE-ORDER" if limit_price else "ORDER",
             "BUY" if quantity > ZERO else "SELL",
             abs(quantity),
             ticker,
             money(verdict.notional),
             decision_id,
+            f" limit {money(limit_price)} {self.config.execution.preorder_time_validity}"
+            if limit_price
+            else "",
         )
 
         try:
-            if self.config.execution.order_type == "limit" and verdict.limit_price:
+            if limit_price is not None:
+                # Market closed: rest a limit order until it opens. The limit is
+                # the point of it — a market order into an opening gap has no
+                # ceiling, this one does.
+                response = self.client.place_limit_order(
+                    ticker,
+                    quantity,
+                    limit_price,
+                    time_validity=self.config.execution.preorder_time_validity,
+                )
+            elif self.config.execution.order_type == "limit" and verdict.limit_price:
                 response = self.client.place_limit_order(ticker, quantity, verdict.limit_price)
             else:
                 response = self.client.place_market_order(ticker, quantity)
@@ -209,6 +253,16 @@ class Executor:
             )
             log.error("broker rejected order %s: %s", decision_id, exc)
             return self.storage.get_order(decision_id)
+        except T212AuthError as exc:
+            # 401/403 is refused before an order can exist, so this is a
+            # rejection, not an unknown outcome. Treating it as unknown would
+            # block all trading over what is usually a credentials or
+            # wrong-environment mistake.
+            self.storage.settle_order(decision_id, STATE_REJECTED, error=str(exc))
+            log.error(
+                "broker refused order %s without creating it: %s", decision_id, exc
+            )
+            return self.storage.get_order(decision_id)
         except T212Error as exc:
             self.storage.settle_order(decision_id, STATE_UNKNOWN, error=str(exc))
             log.critical("ORDER OUTCOME UNKNOWN for %s: %s", decision_id, exc)
@@ -231,6 +285,16 @@ class Executor:
         )
         log.warning("order %s accepted by broker as %s (status=%s)", decision_id, order_id, status)
         return self.storage.get_order(decision_id)
+
+    def _preorder_limit_price(self, verdict: Verdict) -> Decimal | None:
+        """The price to rest a closed-market order at, or None if unknowable."""
+        if verdict.limit_price is not None:
+            return verdict.limit_price
+        price = verdict.reference_price
+        if price is None or price <= ZERO:
+            return None
+        side = "buy" if verdict.quantity > ZERO else "sell"
+        return limit_price_for(side, price, self.config)
 
     # ----------------------------------------------------------- reconciling
     def reconcile_open_orders(self) -> int:

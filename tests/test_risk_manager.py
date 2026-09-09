@@ -140,6 +140,35 @@ def test_stale_quote_blocks_the_trade(config):
     assert verdict.rule == "R07_QUOTE_STALE"
 
 
+def test_a_freshly_fetched_quote_from_a_delayed_feed_is_tradeable(config):
+    # The free feed is ~15 minutes behind the exchange, so as_of is always old
+    # even though the quote was pulled a second ago. That is the feed's delay,
+    # not our data going stale, and it must not block trading.
+    inputs = make_inputs(
+        quotes={TICKER: make_quote(age_seconds=1000, fetched_seconds_ago=1)}
+    )
+    verdict = evaluate(buy(), inputs, config)
+    assert verdict.approved, verdict.reasons
+
+
+def test_a_zero_age_limit_disables_the_staleness_check(config):
+    config = make_config(max_quote_age_seconds=0)
+    inputs = make_inputs(quotes={TICKER: make_quote(age_seconds=100_000)})
+    verdict = evaluate(buy(), inputs, config)
+    assert verdict.approved, verdict.reasons
+
+
+def test_feed_delay_is_only_gated_when_a_delay_limit_is_configured(config):
+    quotes = {TICKER: make_quote(age_seconds=1000, fetched_seconds_ago=1)}
+
+    assert evaluate(buy(), make_inputs(quotes=quotes), config).approved
+
+    strict = make_config(max_quote_delay_seconds=900)
+    verdict = evaluate(buy(), make_inputs(quotes=quotes), strict)
+    assert not verdict.approved
+    assert verdict.rule == "R19_QUOTE_DELAYED"
+
+
 def test_zero_price_quote_blocks_the_trade(config):
     inputs = make_inputs(quotes={TICKER: make_quote(price=0)})
     verdict = evaluate(buy(), inputs, config)
@@ -548,3 +577,74 @@ def test_floor_quantity_in_whole_share_mode():
 
 def test_floor_quantity_of_a_negative_is_zero(config):
     assert floor_quantity(dec("-1"), config) == dec(0)
+
+
+# --------------------------------------------------------------------------- #
+# The minimum order is a money rule, so it is judged in pence
+# --------------------------------------------------------------------------- #
+
+
+def test_a_sell_sized_to_exactly_the_minimum_is_not_lost_to_rounding():
+    """The 19:44 case: £5.00 of a £109 share floors to £4.999939.
+
+    Six hundredths of a penny short of the minimum, rejected with a message
+    that read "partial sell of 5.00 is below the 5.00 minimum order".
+    """
+    config = make_config(min_order=5, min_confidence=0)
+    quotes = {TICKER: make_quote(price="109.0")}
+    account = make_account(cash=0, positions=[make_position(quantity=1, current_price=109)])
+    proposal = Proposal(
+        action="sell", ticker=TICKER, notional=dec("5.00"), confidence=dec(1)
+    )
+
+    verdict = evaluate(proposal, make_inputs(account=account, quotes=quotes), config)
+
+    assert verdict.approved, verdict.reasons
+    assert verdict.quantity == dec("-0.045871")
+
+
+def test_a_partial_sell_genuinely_below_the_minimum_is_still_refused():
+    config = make_config(min_order=5, min_confidence=0)
+    quotes = {TICKER: make_quote(price="109.0")}
+    account = make_account(cash=0, positions=[make_position(quantity=1, current_price=109)])
+    proposal = Proposal(
+        action="sell", ticker=TICKER, notional=dec("2.00"), confidence=dec(1)
+    )
+
+    verdict = evaluate(proposal, make_inputs(account=account, quotes=quotes), config)
+
+    assert not verdict.approved
+    assert verdict.rule == "R16_BELOW_MIN"
+
+
+def test_a_buy_sized_to_exactly_the_minimum_survives_the_quantity_floor():
+    config = make_config(
+        min_order=5, min_confidence=0, max_capital=400, per_trade_cap_pct=25,
+        max_position_pct=25,
+    )
+    quotes = {TICKER: make_quote(price="109.0")}
+    proposal = Proposal(
+        action="buy", ticker=TICKER, notional=dec("5.00"), confidence=dec(1)
+    )
+
+    verdict = evaluate(
+        proposal, make_inputs(account=make_account(cash=400), quotes=quotes), config
+    )
+
+    assert verdict.approved, verdict.reasons
+    assert verdict.quantity == dec("0.045871")
+
+
+def test_a_buy_genuinely_below_the_minimum_is_still_refused():
+    config = make_config(min_order=5, min_confidence=0)
+    quotes = {TICKER: make_quote(price="109.0")}
+    proposal = Proposal(
+        action="buy", ticker=TICKER, notional=dec("2.00"), confidence=dec(1)
+    )
+
+    verdict = evaluate(
+        proposal, make_inputs(account=make_account(cash=50), quotes=quotes), config
+    )
+
+    assert not verdict.approved
+    assert verdict.rule == "R16_BELOW_MIN"

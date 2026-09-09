@@ -52,9 +52,12 @@ def make_config(
     max_trades_per_day: int = 5,
     max_price_deviation_pct: str | float = 2,
     max_quote_age_seconds: int = 900,
+    max_quote_delay_seconds: int = 0,
     min_confidence: str | float = "0.6",
     enforce_allowlist: bool = True,
     order_type: str = "market",
+    preorder_when_closed: bool = False,
+    preorder_time_validity: str = "GOOD_TILL_CANCEL",
     quantity_decimals: int = 6,
     fractional: bool = True,
     paper_slippage_bps: str | float = 0,
@@ -74,6 +77,7 @@ def make_config(
             max_trades_per_day=max_trades_per_day,
             max_price_deviation_pct=dec(max_price_deviation_pct),
             max_quote_age_seconds=max_quote_age_seconds,
+            max_quote_delay_seconds=max_quote_delay_seconds,
             min_confidence=dec(min_confidence),
             enforce_allowlist=enforce_allowlist,
         ),
@@ -84,6 +88,8 @@ def make_config(
             quantity_decimals=quantity_decimals,
             fractional=fractional,
             max_decision_age_seconds=120,
+            preorder_when_closed=preorder_when_closed,
+            preorder_time_validity=preorder_time_validity,
         ),
         schedule=ScheduleConfig(
             cron="0,30 8-16 * * mon-fri",
@@ -134,13 +140,28 @@ def make_account(cash=50, positions: Iterable[Position] = (), source: str = "pap
     )
 
 
-def make_quote(ticker: str = TICKER, price=10, age_seconds: int = 0) -> Quote:
+def make_quote(
+    ticker: str = TICKER,
+    price=10,
+    age_seconds: int = 0,
+    fetched_seconds_ago: int | None = None,
+) -> Quote:
+    """A quote ``age_seconds`` behind the market, fetched ``fetched_seconds_ago``.
+
+    The two default to the same thing, which is the old behaviour. They differ
+    on a delayed feed: ``age_seconds=900, fetched_seconds_ago=0`` is a quote we
+    have just pulled from a 15-minute-delayed source.
+    """
+    now = utcnow()
+    if fetched_seconds_ago is None:
+        fetched_seconds_ago = age_seconds
     return Quote(
         ticker=ticker,
         price=dec(price),
         currency="GBP",
-        as_of=utcnow() - timedelta(seconds=age_seconds),
+        as_of=now - timedelta(seconds=age_seconds),
         source="test",
+        fetched_at=now - timedelta(seconds=fetched_seconds_ago),
     )
 
 

@@ -332,3 +332,31 @@ def test_symbol_overrides_are_parsed(tmp_path):
     )
     config = load(write_config(tmp_path, text), env_file=None)
     assert config.symbol_overrides["AAPL_US_EQ"] == "AAPL"
+
+
+def test_preorder_defaults_are_off_and_good_till_cancel(tmp_path):
+    config = load(write_config(tmp_path, MINIMAL), env_file=None)
+    assert config.execution.preorder_when_closed is False
+    assert config.execution.preorder_time_validity == "GOOD_TILL_CANCEL"
+
+
+def test_preorder_settings_are_read(tmp_path):
+    text = MINIMAL.replace(
+        "watchlist:",
+        "execution:\n"
+        "  preorder_when_closed: true\n"
+        "  preorder_time_validity: day\n"
+        "watchlist:",
+    )
+    config = load(write_config(tmp_path, text), env_file=None)
+    assert config.execution.preorder_when_closed is True
+    assert config.execution.preorder_time_validity == "DAY"
+
+
+def test_an_unknown_time_validity_is_rejected(tmp_path):
+    text = MINIMAL.replace(
+        "watchlist:",
+        "execution:\n  preorder_time_validity: forever\nwatchlist:",
+    )
+    with pytest.raises(ConfigError, match="preorder_time_validity"):
+        load(write_config(tmp_path, text), env_file=None)

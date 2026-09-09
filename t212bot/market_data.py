@@ -167,10 +167,15 @@ class YahooMarketData:
         price, currency = _normalise(raw_price, raw_currency)
 
         market_time = meta.get("regularMarketTime")
+        fetched_at = utcnow()
+        # The exchange timestamp. On a free, delayed feed this trails "now" by
+        # the delay (~15 minutes for LSE), permanently — that is a property of
+        # the feed, not of our data being stale, so it is recorded separately
+        # from ``fetched_at``.
         as_of = (
             datetime.fromtimestamp(int(market_time), tz=timezone.utc)
             if market_time
-            else utcnow()
+            else fetched_at
         )
 
         bars: list[Bar] = []
@@ -191,6 +196,7 @@ class YahooMarketData:
                 currency=currency,
                 as_of=as_of,
                 source="yahoo",
+                fetched_at=fetched_at,
             ),
             PriceHistory(ticker=ticker, bars=tuple(bars[-history_days:])),
         )
@@ -226,7 +232,14 @@ class StaticMarketData:
             Bar(day=now.date(), close=price) for _ in range(max(history_days, 1))
         )
         return (
-            Quote(ticker=ticker, price=price, currency=currency, as_of=now, source="static"),
+            Quote(
+                ticker=ticker,
+                price=price,
+                currency=currency,
+                as_of=now,
+                source="static",
+                fetched_at=now,
+            ),
             PriceHistory(ticker=ticker, bars=bars),
         )
 
@@ -241,7 +254,12 @@ class StaticMarketData:
                 errors[item.ticker] = "no static price configured"
                 continue
             quotes[item.ticker] = Quote(
-                ticker=item.ticker, price=price, currency="GBP", as_of=now, source="static"
+                ticker=item.ticker,
+                price=price,
+                currency="GBP",
+                as_of=now,
+                source="static",
+                fetched_at=now,
             )
             histories[item.ticker] = PriceHistory(
                 ticker=item.ticker, bars=(Bar(day=now.date(), close=price),)

@@ -63,16 +63,28 @@ class RiskConfig:
     daily_loss_limit_pct: Decimal
     max_trades_per_day: int
     max_price_deviation_pct: Decimal
+    # How long ago the quote may have been *fetched* by us. 0 or less disables
+    # the check entirely.
     max_quote_age_seconds: int
     min_confidence: Decimal
     # When True the AI may only act on watch-list tickers. When False it may
     # name any Trading212 instrument (resolved against data/instruments.json and
     # priced in GBP on demand); an unknown ticker is still rejected.
     enforce_allowlist: bool = True
+    # How far behind the market the quote's own exchange timestamp may be.
+    # Free feeds are delayed ~15 minutes as a matter of course, which says
+    # nothing about whether our copy is current, so this is disabled (0) by
+    # default. Set it to e.g. 900 to refuse to trade on a delayed feed.
+    max_quote_delay_seconds: int = 0
 
     def daily_loss_limit(self, max_capital: Decimal) -> Decimal:
         """The P&L level (negative) at or below which trading halts."""
         return -(max_capital * self.daily_loss_limit_pct / Decimal(100))
+
+
+# Order lifetimes the broker understands. DAY dies at the end of the session;
+# GOOD_TILL_CANCEL rests until it fills or is pulled.
+TIME_VALIDITIES = ("DAY", "GOOD_TILL_CANCEL")
 
 
 @dataclass(frozen=True)
@@ -83,6 +95,11 @@ class ExecutionConfig:
     quantity_decimals: int
     fractional: bool
     max_decision_age_seconds: int
+    # When the market is closed, place a resting limit order instead of a
+    # market order the broker would simply refuse — a pre-order that waits for
+    # the open. The limit price caps what a gap at the open can cost you.
+    preorder_when_closed: bool = False
+    preorder_time_validity: str = "GOOD_TILL_CANCEL"
 
 
 @dataclass(frozen=True)
@@ -467,6 +484,7 @@ def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env"
         max_quote_age_seconds=_int(risk_raw, "max_quote_age_seconds", "risk", 900),
         min_confidence=_dec(risk_raw, "min_confidence", "risk", "0.6"),
         enforce_allowlist=bool(risk_raw.get("enforce_allowlist", True)),
+        max_quote_delay_seconds=_int(risk_raw, "max_quote_delay_seconds", "risk", 0),
     )
     if not (Decimal(0) <= risk.min_confidence <= Decimal(1)):
         raise ConfigError("risk.min_confidence must be between 0 and 1")
@@ -478,6 +496,14 @@ def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env"
     quantity_decimals = _int(exec_raw, "quantity_decimals", "execution", 6)
     if not (0 <= quantity_decimals <= 12):
         raise ConfigError("execution.quantity_decimals must be between 0 and 12")
+    time_validity = str(
+        exec_raw.get("preorder_time_validity", "GOOD_TILL_CANCEL")
+    ).strip().upper()
+    if time_validity not in TIME_VALIDITIES:
+        raise ConfigError(
+            "execution.preorder_time_validity must be one of "
+            f"{'|'.join(TIME_VALIDITIES)} (got {time_validity!r})"
+        )
     execution = ExecutionConfig(
         order_type=order_type,
         limit_offset_bps=_dec(exec_raw, "limit_offset_bps", "execution", 25),
@@ -485,6 +511,8 @@ def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env"
         quantity_decimals=quantity_decimals,
         fractional=bool(exec_raw.get("fractional", True)),
         max_decision_age_seconds=_int(exec_raw, "max_decision_age_seconds", "execution", 120),
+        preorder_when_closed=bool(exec_raw.get("preorder_when_closed", False)),
+        preorder_time_validity=time_validity,
     )
 
     sched_raw = _section(data, "schedule")
@@ -562,7 +590,9 @@ def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env"
     ai = AIConfig(
         provider=resolve_provider(str(ai_raw.get("provider", "auto")), secrets),
         timeout_seconds=_int(ai_raw, "timeout_seconds", "ai", 60),
-        max_tokens=_int(ai_raw, "max_tokens", "ai", 1024),
+        # Reasoning models spend most of their budget before they emit a single
+        # character of the answer; 1024 left the JSON truncated mid-field.
+        max_tokens=_int(ai_raw, "max_tokens", "ai", 4096),
         openrouter_base_url=str(
             openrouter_raw.get("base_url", "https://openrouter.ai/api/v1")
         ).rstrip("/"),

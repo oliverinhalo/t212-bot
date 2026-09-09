@@ -72,10 +72,14 @@ Reply with a single JSON object and nothing else. No prose, no markdown fences.
   "ticker": "<exact ticker from the allow-list, or null when holding>",
   "notional_or_qty": <number, or null when holding>,
   "size_unit": "gbp" | "shares",
-  "price": <the price per share you are assuming, or null>,
   "confidence": <number between 0 and 1>,
+  "price": <the price per share you are assuming, or null>,
   "reasoning": "<one or two sentences, under 300 characters>"
 }
+
+Emit those keys in that order and keep the whole reply short. A reply that runs \
+out of room before the JSON object is closed loses the cycle, so spend your \
+budget on the decision, not on the explanation.
 
 "size_unit" says how to read "notional_or_qty": "gbp" means an amount of money \
 to spend or raise, "shares" means a number of shares. Prefer "gbp" for buys.
@@ -166,6 +170,9 @@ class OpenRouterProvider:
     name = "openrouter"
     _key_env_var = "OPENROUTER_API_KEY"
     _error_label = "OpenRouter"
+    # Upper bound for the one truncation retry, so a runaway reasoning model
+    # cannot be handed an unbounded budget.
+    _MAX_TOKEN_CEILING = 16384
 
     def __init__(
         self,
@@ -220,9 +227,10 @@ class OpenRouterProvider:
         raise ProviderError(f"every {self._error_label} model failed — " + " | ".join(errors))
 
     def _complete_one(self, model: str, system: str, user: str) -> str:
+        max_tokens = self._max_tokens
         body: dict[str, Any] = {
             "model": model,
-            "max_tokens": self._max_tokens,
+            "max_tokens": max_tokens,
             "temperature": 0.2,
             "messages": [
                 {"role": "system", "content": system},
@@ -233,7 +241,11 @@ class OpenRouterProvider:
         if want_json:
             body["response_format"] = {"type": "json_object"}
 
-        for _ in range(2):
+        bumped = False
+        # Two retries are possible and independent: one to drop structured-output
+        # mode, one to raise the token ceiling. Four passes covers both plus the
+        # request that finally answers.
+        for _ in range(4):
             self.last_http_calls += 1
             try:
                 response = self._http.post(
@@ -259,18 +271,51 @@ class OpenRouterProvider:
             choices = payload.get("choices") or []
             if not choices:
                 raise ProviderError(f"no choices: {str(payload)[:200]}")
-            message = choices[0].get("message") or {}
+            choice = choices[0]
+            message = choice.get("message") or {}
             content = message.get("content") or message.get("reasoning")
+            truncated = str(
+                choice.get("finish_reason") or choice.get("native_finish_reason") or ""
+            ).lower() in ("length", "max_tokens")
+
+            # A reasoning model can spend the whole budget thinking and stop
+            # mid-JSON, or before writing any answer at all. Both look like a
+            # dead cycle downstream, so buy it more room and ask again.
+            if truncated and not bumped:
+                bumped = True
+                max_tokens = min(max(max_tokens * 4, 4096), self._MAX_TOKEN_CEILING)
+                if max_tokens > body["max_tokens"]:
+                    log.warning(
+                        "%s model %s hit its token ceiling; retrying with max_tokens=%d",
+                        self._error_label,
+                        model,
+                        max_tokens,
+                    )
+                    body["max_tokens"] = max_tokens
+                    continue
+
             if not content:
+                if truncated:
+                    raise ProviderError(
+                        f"{self._error_label} ran out of tokens before answering "
+                        f"(max_tokens={body['max_tokens']}); raise ai.max_tokens"
+                    )
                 raise ProviderError(
                     f"{self._error_label} returned an empty message. "
                     f"model={payload.get('model')!r}, "
                     f"message={message!r}, "
                     f"usage={payload.get('usage')!r}"
                 )
+            if truncated:
+                log.warning(
+                    "%s model %s was cut off at max_tokens=%d; parsing what arrived",
+                    self._error_label,
+                    model,
+                    body["max_tokens"],
+                )
             return content
 
-        raise ProviderError("structured-output retry exhausted")
+        raise ProviderError("retries exhausted without a usable reply")
 
 
 class OmniRouteProvider(OpenRouterProvider):
@@ -359,6 +404,16 @@ class AnthropicProvider:
         text = "".join(
             block.text for block in response.content if getattr(block, "type", "") == "text"
         )
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            if not text.strip():
+                raise ProviderError(
+                    f"Anthropic ran out of tokens before answering "
+                    f"(max_tokens={self._max_tokens}); raise ai.max_tokens"
+                )
+            log.warning(
+                "Anthropic was cut off at max_tokens=%d; parsing what arrived",
+                self._max_tokens,
+            )
         if not text.strip():
             raise ProviderError("Anthropic returned no text content")
         return text
@@ -514,12 +569,69 @@ _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _THINK = re.compile(r"<(think|reasoning|thinking)>.*?</\1>", re.DOTALL | re.IGNORECASE)
 
 
+def _close_truncated(text: str) -> str | None:
+    """Rebuild a JSON object that the model was cut off part-way through.
+
+    A reply that hits the token ceiling ends mid-field —
+    ``{"action": "buy", "ticker": "VUSAl_EQ", "notional`` — and is worth
+    something: the members that did arrive are complete and unambiguous. Rewind
+    to the last member that finished, drop the half-written one, and close
+    whatever is still open. Anything the model never got to is simply absent,
+    and absent fields already degrade safely (no size is R12, no confidence is
+    below any threshold).
+
+    Returns None when ``text`` is not a truncated object — either it is
+    balanced already, or there is nothing complete enough to keep.
+    """
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    cut: int | None = None
+    cut_stack: list[str] = []
+
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append("}" if char == "{" else "]")
+        elif char in "}]":
+            if not stack:
+                return None
+            stack.pop()
+            if stack:
+                # A nested value just closed: everything up to here is whole.
+                cut, cut_stack = index + 1, list(stack)
+        elif char == "," and stack:
+            cut, cut_stack = index, list(stack)
+
+    if not stack and not in_string:
+        return None  # balanced — not a truncation, so not ours to repair
+    if cut is None:
+        return None  # nothing completed before the cut-off
+    return text[:cut] + "".join(reversed(cut_stack))
+
+
 def _extract_json(raw: str) -> Mapping[str, Any]:
+    """Pull one JSON object out of a model response. Raises if there is none."""
+    return _extract_json_flagged(raw)[0]
+
+
+def _extract_json_flagged(raw: str) -> tuple[Mapping[str, Any], bool]:
     """Pull one JSON object out of a model response.
 
     Models wrap JSON in fences, prefix it with "Here you go:", or emit two
     objects. Rather than trust any of that, find the first balanced object and
-    parse it. Failure raises, and the caller turns that into a hold.
+    parse it. A reply that was cut off mid-object is repaired as a last resort;
+    the second element of the return value says whether that happened. Failure
+    raises, and the caller turns that into a hold.
     """
     text = (raw or "").strip()
     if not text:
@@ -538,7 +650,7 @@ def _extract_json(raw: str) -> Mapping[str, Any]:
     try:
         parsed = json.loads(text)
         if isinstance(parsed, Mapping):
-            return parsed
+            return parsed, False
     except json.JSONDecodeError:
         pass
 
@@ -569,9 +681,23 @@ def _extract_json(raw: str) -> Mapping[str, Any]:
                     except json.JSONDecodeError:
                         break
                     if isinstance(candidate, Mapping):
-                        return candidate
+                        return candidate, False
                     break
         start = text.find("{", start + 1)
+
+    # Nothing balanced. If the reply simply stopped early, keep the part that
+    # did arrive rather than throwing the whole cycle away.
+    start = text.find("{")
+    if start != -1:
+        repaired = _close_truncated(text[start:])
+        if repaired is not None:
+            try:
+                candidate = json.loads(repaired)
+            except json.JSONDecodeError:
+                candidate = None
+            if isinstance(candidate, Mapping):
+                return candidate, True
+        raise ValueError(f"response was cut off before anything usable: {text[:200]!r}")
 
     raise ValueError(f"no JSON object found in response: {text[:200]!r}")
 
@@ -579,9 +705,11 @@ def _extract_json(raw: str) -> Mapping[str, Any]:
 def parse_proposal(raw: str) -> Proposal:
     """Turn a raw model response into a Proposal. Never raises."""
     try:
-        data = _extract_json(raw)
+        data, recovered = _extract_json_flagged(raw)
     except ValueError as exc:
         return Proposal(action="hold", reasoning=f"unparseable AI response: {exc}")
+    if recovered:
+        log.warning("AI reply was truncated; recovered %s", sorted(data))
 
     action = str(data.get("action", "hold")).strip().lower()
     if action not in ("buy", "sell", "hold"):
@@ -591,6 +719,12 @@ def parse_proposal(raw: str) -> Proposal:
     ticker = str(ticker_raw).strip() if ticker_raw not in (None, "", "null") else None
 
     reasoning = str(data.get("reasoning", "") or "")[:MAX_REASONING_CHARS]
+    if recovered:
+        # Say so in the audit log: a recovered proposal is missing whatever the
+        # model never got to write, and that shapes how it is judged downstream.
+        reasoning = f"[recovered from a truncated reply] {reasoning}".strip()[
+            :MAX_REASONING_CHARS
+        ]
 
     try:
         confidence = maybe_dec(data.get("confidence")) or ZERO

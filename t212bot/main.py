@@ -18,6 +18,7 @@ import logging
 import logging.handlers
 import signal
 import sys
+import time
 import uuid
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time as dtime
@@ -246,8 +247,15 @@ def decide_advice(
     trades_today: int,
     day_pnl: Decimal,
     trading_day: date,
+    insist: bool = False,
 ) -> AIResult:
-    """The decision ladder: cache skip -> budget guard -> LLM -> local fallback."""
+    """The decision ladder: cache skip -> budget guard -> LLM -> local fallback.
+
+    ``insist`` is set when an operator is deliberately retrying (``--until-trade``).
+    Retries happen precisely because nothing has changed yet, so the
+    "nothing moved, don't spend a call" skip would turn every attempt after the
+    first into a no-op. Under ``insist`` the model is asked every time.
+    """
     config = runtime.config
     storage = runtime.storage
     provider_name = getattr(runtime.ai, "name", "unknown")
@@ -261,9 +269,10 @@ def decide_advice(
         return result
 
     # 1. Nothing material changed since a cycle that held — do not spend a call.
-    if config.ai.skip_when_unchanged and storage.last_cycle_fingerprint() == (
-        fingerprint,
-        "hold",
+    if (
+        config.ai.skip_when_unchanged
+        and not insist
+        and storage.last_cycle_fingerprint() == (fingerprint, "hold")
     ):
         log.info("no material change since the last cycle; skipping the AI call")
         return finish(
@@ -271,7 +280,10 @@ def decide_advice(
         )
 
     # 2. Free-tier daily budget. Hand over to the local strategy before the cap.
-    if provider_name == "openrouter":
+    #    OpenRouter only: it is the one provider with a hard free-tier cap.
+    #    OmniRoute is self-hosted and unmetered, Anthropic is pay-as-you-go, and
+    #    a budget of 0 or less means "no limit" for everyone.
+    if provider_name == "openrouter" and config.ai.daily_request_budget > 0:
         used = storage.ai_calls_today(utc_day)
         if used >= config.ai.daily_request_budget:
             log.warning(
@@ -439,8 +451,23 @@ def resolve_off_list_instrument(
 # --------------------------------------------------------------------------- #
 
 
-def run_cycle(runtime: Runtime, *, dry_run: bool = False, force: bool = False) -> str:
-    """Run one full decision cycle. Returns a short status string."""
+def run_cycle(
+    runtime: Runtime,
+    *,
+    dry_run: bool = False,
+    force: bool = False,
+    insist: bool = False,
+    preorder: bool | None = None,
+) -> str:
+    """Run one full decision cycle. Returns a short status string.
+
+    ``insist`` only reaches the AI ladder, where it disables the
+    "nothing changed, skip the call" shortcut. ``preorder`` decides how an
+    approved order is placed when the market is closed — resting limit order
+    instead of a market order — and defaults to
+    ``execution.preorder_when_closed``. Neither grants any extra permission:
+    every risk rule applies exactly as it does on a scheduled cycle.
+    """
     config = runtime.config
     storage = runtime.storage
     decision_id = uuid.uuid4().hex
@@ -480,6 +507,18 @@ def run_cycle(runtime: Runtime, *, dry_run: bool = False, force: bool = False) -
     open_now, why_closed = within_trading_window(config, now)
     if not open_now and not force:
         return halt(f"market closed: {why_closed}", status="skipped")
+
+    # A pre-order only means anything while the market is shut; once it is
+    # open there is nothing to wait for and an ordinary order is placed.
+    if preorder is None:
+        preorder = config.execution.preorder_when_closed
+    preorder = bool(preorder) and not open_now
+    if preorder:
+        log.warning(
+            "market closed (%s) — an approved order will be pre-ordered as a %s limit order",
+            why_closed,
+            config.execution.preorder_time_validity,
+        )
 
     # 5. Chase up anything the broker accepted but had not filled.
     try:
@@ -580,6 +619,7 @@ def run_cycle(runtime: Runtime, *, dry_run: bool = False, force: bool = False) -
         trades_today=trades_today,
         day_pnl=pnl,
         trading_day=day,
+        insist=insist,
     )
     storage.record_ai(decision_id, result)
     log.info(
@@ -650,6 +690,7 @@ def run_cycle(runtime: Runtime, *, dry_run: bool = False, force: bool = False) -
         verdict,
         day,
         lambda: load_account_state(config, storage, runtime.client, snapshot.prices()),
+        preorder=preorder,
     )
     status = record.state if record else "not-placed"
     storage.finish_cycle(decision_id, "completed", f"order {status}")
@@ -663,6 +704,82 @@ def safe_cycle(runtime: Runtime, **kwargs: Any) -> str:
     except Exception:  # noqa: BLE001 - log and live to trade another cycle
         log.exception("cycle failed with an unhandled error")
         return "error"
+
+
+# Cycle outcomes that end a --until-trade run.
+#
+# An order that reached the market is the goal. "unknown" and "halted" end it
+# too, for the opposite reason: a stranded order or a tripped breaker/kill
+# switch needs a human, and every further attempt would stop at the same gate.
+# Everything else — no-trade, a rejected or withdrawn order, an error, a closed
+# market that may open before the deadline — is worth another attempt.
+_TRADED_STATUSES = frozenset({"order:filled", "order:accepted"})
+_FATAL_STATUSES = frozenset({"halted", "order:unknown"})
+
+
+def run_until_trade(
+    runtime: Runtime,
+    *,
+    dry_run: bool = False,
+    force: bool = False,
+    preorder: bool | None = None,
+    deadline_minutes: float = 60.0,
+    interval_seconds: float = 60.0,
+) -> tuple[bool, str]:
+    """Run cycles until one trades, the deadline passes, or a human is needed.
+
+    Returns ``(traded, last_status)``. This changes *nothing* about what is
+    allowed to trade: it re-runs the ordinary cycle, and every rejection is a
+    real rejection by the risk manager. A run that ends without an order means
+    the bot never had a proposal it was willing to act on — that is an answer,
+    not a failure of the loop.
+
+    In ``dry_run`` an approved-but-unplaced verdict counts as the result: the
+    question being asked is "would it trade", and it has been answered.
+    """
+    deadline = time.monotonic() + deadline_minutes * 60
+    attempt = 0
+    status = "not-started"
+
+    while True:
+        attempt += 1
+        remaining = deadline - time.monotonic()
+        log.warning(
+            "attempt %d (%s, %.0f min left of the %g-minute window)",
+            attempt,
+            "forced" if force else "normal",
+            max(remaining, 0) / 60,
+            deadline_minutes,
+        )
+        status = safe_cycle(
+            runtime, dry_run=dry_run, force=force, insist=True, preorder=preorder
+        )
+        log.info("attempt %d finished: %s", attempt, status)
+
+        if status in _TRADED_STATUSES or (dry_run and status == "dry-run"):
+            log.warning("attempt %d got there: %s (after %d attempt(s))", attempt, status, attempt)
+            return True, status
+        if status in _FATAL_STATUSES:
+            log.error(
+                "stopping after attempt %d: %s needs a human, retrying cannot clear it",
+                attempt,
+                status,
+            )
+            return False, status
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.warning(
+                "gave up after %d attempt(s) over %g minutes; last result: %s",
+                attempt,
+                deadline_minutes,
+                status,
+            )
+            return False, status
+
+        wait = min(interval_seconds, remaining)
+        log.info("no trade yet; next attempt in %.0fs", wait)
+        time.sleep(wait)
 
 
 # --------------------------------------------------------------------------- #
@@ -781,6 +898,38 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run even outside market hours (still honours every safety rule)",
     )
+    parser.add_argument(
+        "--preorder",
+        action="store_true",
+        help=(
+            "out of hours, rest an approved order as a limit order that waits for "
+            "the open instead of a market order the broker would refuse. "
+            "Implies --force. No effect while the market is open."
+        ),
+    )
+    parser.add_argument(
+        "--until-trade",
+        action="store_true",
+        help=(
+            "keep running cycles until one places an order or the window runs out "
+            "(default 60 minutes). Combine with --force to ignore market hours. "
+            "Exits 0 if it traded, 1 if it never did."
+        ),
+    )
+    parser.add_argument(
+        "--until-trade-minutes",
+        type=float,
+        default=60.0,
+        metavar="MINUTES",
+        help="how long --until-trade keeps trying (default: 60)",
+    )
+    parser.add_argument(
+        "--retry-seconds",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help="wait between --until-trade attempts (default: 60)",
+    )
     parser.add_argument("--status", action="store_true", help="print current state and exit")
     parser.add_argument(
         "--list-unresolved", action="store_true", help="show orders needing manual reconciliation"
@@ -797,7 +946,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run_scheduler(runtime: Runtime, force: bool) -> int:
+def run_scheduler(runtime: Runtime, force: bool, preorder: bool | None = None) -> int:
     from apscheduler.schedulers.blocking import BlockingScheduler
     from apscheduler.triggers.cron import CronTrigger
 
@@ -806,7 +955,7 @@ def run_scheduler(runtime: Runtime, force: bool) -> int:
     scheduler.add_job(
         safe_cycle,
         CronTrigger.from_crontab(config.schedule.cron, timezone=config.schedule.timezone),
-        kwargs={"runtime": runtime, "force": force},
+        kwargs={"runtime": runtime, "force": force, "preorder": preorder},
         id="cycle",
         max_instances=1,       # never let two cycles overlap
         coalesce=True,         # a backlog after a pause collapses to one run
@@ -876,11 +1025,36 @@ def main(argv: list[str] | None = None) -> int:
                 stranded,
             )
 
+        # A pre-order is placed while the market is shut, so asking for one
+        # means running out of hours too.
+        force = args.force or args.preorder
+        preorder = True if args.preorder else None
+
+        if args.until_trade:
+            if args.until_trade_minutes <= 0:
+                print("--until-trade-minutes must be positive", file=sys.stderr)
+                return 2
+            if args.retry_seconds < 0:
+                print("--retry-seconds must not be negative", file=sys.stderr)
+                return 2
+            traded, status = run_until_trade(
+                runtime,
+                dry_run=args.dry_run,
+                force=force,
+                preorder=preorder,
+                deadline_minutes=args.until_trade_minutes,
+                interval_seconds=args.retry_seconds,
+            )
+            log.info("until-trade finished: %s", status)
+            return 0 if traded else 1
+
         if args.dry_run or args.once:
-            status = safe_cycle(runtime, dry_run=args.dry_run, force=args.force)
+            status = safe_cycle(
+                runtime, dry_run=args.dry_run, force=force, preorder=preorder
+            )
             log.info("cycle finished: %s", status)
             return 0
-        return run_scheduler(runtime, args.force)
+        return run_scheduler(runtime, force, preorder)
     finally:
         runtime.close()
 

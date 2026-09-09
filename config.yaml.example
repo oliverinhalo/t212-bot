@@ -36,8 +36,18 @@ risk:
   # more than this %. Guards against stale/hallucinated prices.
   max_price_deviation_pct: 2.0
 
-  # Quotes older than this are treated as missing, and no order is approved.
+  # How long ago the bot may have *fetched* a quote and still trade on it. This
+  # measures our own market data going stale (the feed stopped answering, a
+  # cached quote is being reused), not how far behind the exchange the feed is.
+  # 0 disables the check.
   max_quote_age_seconds: 1800
+
+  # How far behind the market a quote's own exchange timestamp may be. Free
+  # feeds (Yahoo) are delayed ~15 minutes as a matter of course, so a freshly
+  # fetched LSE quote is always ~900s "old" by this measure — which used to
+  # block every order (R07_QUOTE_STALE). 0 (the default) accepts a delayed
+  # feed; set it to e.g. 900 to refuse to trade on one.
+  max_quote_delay_seconds: 0
 
   # Proposals below this confidence are downgraded to hold.
   min_confidence: 0.10
@@ -57,6 +67,17 @@ execution:
 
   # Assumed adverse slippage when simulating a fill in paper mode.
   paper_slippage_bps: 10
+
+  # When the market is closed, place a resting LIMIT order that waits for the
+  # open instead of a market order the broker simply refuses. The limit sits
+  # limit_offset_bps away from the last quote in the direction that helps it
+  # fill, which also caps what an opening gap can cost you: a buy will not pay
+  # above the limit, it just does not fill.
+  # The --preorder CLI flag turns this on for one run without editing this file.
+  preorder_when_closed: false
+  # How long a pre-order rests at the broker: GOOD_TILL_CANCEL or DAY.
+  # GOOD_TILL_CANCEL survives to the next session; DAY expires with today's.
+  preorder_time_validity: GOOD_TILL_CANCEL
 
   # Order quantities are rounded DOWN to this many decimal places, so rounding
   # can only ever shrink an order. Set fractional: false for whole shares only.
@@ -90,15 +111,21 @@ ai:
   #   stub      — deterministic "hold", for testing the pipeline with no API calls.
   provider: omniroute
   timeout_seconds: 60
-  max_tokens: 1024
+  # Reasoning models spend most of this thinking before writing a single
+  # character of the answer. Too small and the JSON arrives cut off mid-field.
+  max_tokens: 4096
 
   # Stop calling OpenRouter after this many HTTP calls in a UTC day (free tier
   # is ~50/day). Past this the local rule-based strategy takes over.
+  # OpenRouter ONLY — OmniRoute (self-hosted, unmetered) and Anthropic
+  # (pay-as-you-go) are never metered by this. 0 means no limit at all.
   daily_request_budget: 45
   # On model failure / spent budget, use the local strategy instead of "hold".
   local_fallback: true
   # Skip the LLM when nothing material moved since a cycle that held.
   # Set false to not limit or skip AI calls (especially for unmetered OmniRoute).
+  # --until-trade ignores this either way: a retry exists because nothing has
+  # changed yet, so the model is asked on every attempt.
   skip_when_unchanged: false
   min_price_move_pct: 0.5
 

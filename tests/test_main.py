@@ -409,3 +409,163 @@ def test_a_cycle_never_exceeds_the_capital_cap_over_many_runs(storage):
     )
     assert invested <= config.capital.max_capital
     assert storage.paper_cash() >= Decimal(0)
+
+
+# --------------------------------------------------------------------------- #
+# --until-trade: keep trying until an order lands, or the window runs out
+# --------------------------------------------------------------------------- #
+
+
+class FlakyProvider(SpyProvider):
+    """Holds for the first ``holds`` calls, then proposes a buy."""
+
+    def __init__(self, holds: int):
+        super().__init__(name="omniroute")
+        self._holds = holds
+
+    def complete(self, system, user):
+        self.calls += 1
+        if self.calls <= self._holds:
+            return json.dumps({"action": "hold", "confidence": 1})
+        return buy_response()
+
+
+def test_until_trade_keeps_going_until_an_order_lands(storage):
+    from t212bot.main import run_until_trade
+
+    provider = FlakyProvider(holds=2)
+    runtime = make_runtime(storage)
+    runtime.ai = provider
+
+    traded, status = run_until_trade(
+        runtime, force=True, deadline_minutes=5, interval_seconds=0
+    )
+    assert traded
+    assert status == "order:filled"
+    assert provider.calls == 3
+    assert storage.paper_positions()[TICKER][0] == dec(1)
+
+
+def test_until_trade_asks_the_model_every_attempt_despite_the_unchanged_skip(storage):
+    # The market does not move between retries — that is the whole point of
+    # retrying — so the "nothing changed" shortcut must not silence them.
+    from t212bot.main import run_until_trade
+
+    provider = FlakyProvider(holds=1)
+    runtime = make_runtime(storage)
+    runtime.ai = provider
+    assert runtime.config.ai.skip_when_unchanged
+
+    traded, status = run_until_trade(
+        runtime, force=True, deadline_minutes=5, interval_seconds=0
+    )
+    assert traded and status == "order:filled"
+    # Attempt 1 held; attempt 2 reached the model rather than the cached hold.
+    assert provider.calls == 2
+    assert storage.recent_decisions(1)[0]["provider"] == "omniroute"
+
+
+def test_until_trade_gives_up_at_the_deadline_rather_than_running_forever(storage):
+    from t212bot.main import run_until_trade
+
+    runtime = make_runtime(storage)  # stub provider always holds
+    traded, status = run_until_trade(
+        runtime, force=True, deadline_minutes=1 / 600, interval_seconds=0
+    )
+    assert not traded
+    assert status == "no-trade"
+    assert storage.paper_positions() == {}
+
+
+def test_until_trade_stops_immediately_on_a_halt_that_needs_a_human(storage, tmp_path):
+    from t212bot.main import run_until_trade
+
+    from dataclasses import replace
+
+    stop_file = tmp_path / "STOP"
+    stop_file.write_text("halt")
+    config = make_config(mode="paper")
+    runtime = make_runtime(storage, config, ai_response=buy_response())
+    runtime.config = replace(config, stop_file=stop_file)
+
+    traded, status = run_until_trade(
+        runtime, force=True, deadline_minutes=60, interval_seconds=0
+    )
+    assert not traded
+    assert status == "halted"
+
+
+def test_until_trade_treats_an_approved_dry_run_as_the_answer(storage):
+    from t212bot.main import run_until_trade
+
+    runtime = make_runtime(storage, ai_response=buy_response())
+    traded, status = run_until_trade(
+        runtime, dry_run=True, force=True, deadline_minutes=5, interval_seconds=0
+    )
+    assert traded
+    assert status == "dry-run"
+    assert storage.paper_positions() == {}
+
+
+# --------------------------------------------------------------------------- #
+# Out-of-hours pre-orders
+# --------------------------------------------------------------------------- #
+
+
+def _window(config, *, open_now: bool):
+    """A config whose trading window is deterministically open or shut."""
+    from dataclasses import replace
+
+    schedule = replace(
+        config.schedule,
+        market_open="00:00" if open_now else "00:00",
+        market_close="23:59" if open_now else "00:00",
+        trading_days=("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+        if open_now
+        else ("nev",),
+    )
+    return replace(config, schedule=schedule)
+
+
+def _preorder_flag(storage, decision_id="d1"):
+    row = storage._read_one(
+        "SELECT raw_response FROM orders WHERE decision_id = ?", (decision_id,)
+    )
+    return json.loads(row["raw_response"]).get("preorder")
+
+
+def test_a_closed_market_preorders_when_asked(storage):
+    config = _window(make_config(mode="paper"), open_now=False)
+    runtime = make_runtime(storage, config, ai_response=buy_response())
+
+    assert run_cycle(runtime, force=True, preorder=True) == "order:filled"
+    order = storage.orders_today(trading_day(config))[0]
+    assert _preorder_flag(storage, order.decision_id) is True
+
+
+def test_an_open_market_places_an_ordinary_order_even_with_preorder_asked(storage):
+    # Nothing to wait for: the pre-order path is for a shut market only.
+    config = _window(make_config(mode="paper"), open_now=True)
+    runtime = make_runtime(storage, config, ai_response=buy_response())
+
+    assert run_cycle(runtime, force=True, preorder=True) == "order:filled"
+    order = storage.orders_today(trading_day(config))[0]
+    assert _preorder_flag(storage, order.decision_id) is None
+
+
+def test_preorder_when_closed_config_needs_no_flag(storage):
+    config = _window(make_config(mode="paper", preorder_when_closed=True), open_now=False)
+    runtime = make_runtime(storage, config, ai_response=buy_response())
+
+    assert run_cycle(runtime, force=True) == "order:filled"
+    order = storage.orders_today(trading_day(config))[0]
+    assert _preorder_flag(storage, order.decision_id) is True
+
+
+def test_a_closed_market_without_preorder_places_an_ordinary_order(storage):
+    config = _window(make_config(mode="paper"), open_now=False)
+    runtime = make_runtime(storage, config, ai_response=buy_response())
+
+    assert run_cycle(runtime, force=True) == "order:filled"
+    order = storage.orders_today(trading_day(config))[0]
+    assert _preorder_flag(storage, order.decision_id) is None
