@@ -18,7 +18,7 @@ Rule codes (also written to the audit log, so keep them stable):
   R04_HOLD             the AI said hold, or proposed nothing actionable
   R05_ALLOWLIST        ticker is not on the configured allow-list
   R06_QUOTE_MISSING    no quote for the ticker
-  R07_QUOTE_STALE      quote older than risk.max_quote_age_seconds
+  R07_QUOTE_STALE      quote fetched longer ago than risk.max_quote_age_seconds
   R08_QUOTE_INVALID    quote price is zero or negative
   R09_PRICE_DEVIATION  AI's implied price is far from the last quote
   R10_FREQUENCY        already hit risk.max_trades_per_day
@@ -30,6 +30,7 @@ Rule codes (also written to the audit log, so keep them stable):
   R16_BELOW_MIN        approvable size is under capital.min_order_gbp
   R17_QUANTITY_ZERO    size rounds down to zero shares
   R18_NO_POSITION      sell with nothing held (this is also the no-shorting rule)
+  R19_QUOTE_DELAYED    feed's own delay exceeds risk.max_quote_delay_seconds
   OK                   approved
 """
 
@@ -163,14 +164,37 @@ def _check_quote(ticker: str, inputs: RiskInputs, config: AppConfig) -> Verdict 
         return reject(
             "R08_QUOTE_INVALID", f"quote price for {ticker} is {quote.price}", ticker=ticker
         )
-    age = quote.age_seconds(inputs.now)
-    if age > config.risk.max_quote_age_seconds:
-        return reject(
-            "R07_QUOTE_STALE",
-            f"quote for {ticker} is {age:.0f}s old, limit is "
-            f"{config.risk.max_quote_age_seconds}s",
-            ticker=ticker,
-        )
+    # Two different things can be wrong with a quote's timing, and conflating
+    # them is what used to block every trade on a delayed feed:
+    #
+    #   staleness — how long ago *we* fetched it. This is the one that matters:
+    #               it says our own market data has stopped updating.
+    #   delay     — how far behind the exchange timestamp is. On a free feed
+    #               this is a constant ~15 minutes and says nothing about
+    #               whether our data is current, so it is gated separately and
+    #               is off by default.
+    #
+    # Either limit is disabled by setting it to 0 or less.
+    max_age = config.risk.max_quote_age_seconds
+    if max_age > 0:
+        staleness = quote.staleness_seconds(inputs.now)
+        if staleness > max_age:
+            return reject(
+                "R07_QUOTE_STALE",
+                f"quote for {ticker} was fetched {staleness:.0f}s ago, limit is {max_age}s",
+                ticker=ticker,
+            )
+
+    max_delay = config.risk.max_quote_delay_seconds
+    if max_delay > 0:
+        delay = quote.age_seconds(inputs.now)
+        if delay > max_delay:
+            return reject(
+                "R19_QUOTE_DELAYED",
+                f"quote for {ticker} is timestamped {delay:.0f}s behind the market, "
+                f"limit is {max_delay}s",
+                ticker=ticker,
+            )
     return quote
 
 

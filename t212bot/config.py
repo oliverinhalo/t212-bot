@@ -63,12 +63,19 @@ class RiskConfig:
     daily_loss_limit_pct: Decimal
     max_trades_per_day: int
     max_price_deviation_pct: Decimal
+    # How long ago the quote may have been *fetched* by us. 0 or less disables
+    # the check entirely.
     max_quote_age_seconds: int
     min_confidence: Decimal
     # When True the AI may only act on watch-list tickers. When False it may
     # name any Trading212 instrument (resolved against data/instruments.json and
     # priced in GBP on demand); an unknown ticker is still rejected.
     enforce_allowlist: bool = True
+    # How far behind the market the quote's own exchange timestamp may be.
+    # Free feeds are delayed ~15 minutes as a matter of course, which says
+    # nothing about whether our copy is current, so this is disabled (0) by
+    # default. Set it to e.g. 900 to refuse to trade on a delayed feed.
+    max_quote_delay_seconds: int = 0
 
     def daily_loss_limit(self, max_capital: Decimal) -> Decimal:
         """The P&L level (negative) at or below which trading halts."""
@@ -467,6 +474,7 @@ def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env"
         max_quote_age_seconds=_int(risk_raw, "max_quote_age_seconds", "risk", 900),
         min_confidence=_dec(risk_raw, "min_confidence", "risk", "0.6"),
         enforce_allowlist=bool(risk_raw.get("enforce_allowlist", True)),
+        max_quote_delay_seconds=_int(risk_raw, "max_quote_delay_seconds", "risk", 0),
     )
     if not (Decimal(0) <= risk.min_confidence <= Decimal(1)):
         raise ConfigError("risk.min_confidence must be between 0 and 1")
@@ -562,7 +570,9 @@ def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env"
     ai = AIConfig(
         provider=resolve_provider(str(ai_raw.get("provider", "auto")), secrets),
         timeout_seconds=_int(ai_raw, "timeout_seconds", "ai", 60),
-        max_tokens=_int(ai_raw, "max_tokens", "ai", 1024),
+        # Reasoning models spend most of their budget before they emit a single
+        # character of the answer; 1024 left the JSON truncated mid-field.
+        max_tokens=_int(ai_raw, "max_tokens", "ai", 4096),
         openrouter_base_url=str(
             openrouter_raw.get("base_url", "https://openrouter.ai/api/v1")
         ).rstrip("/"),

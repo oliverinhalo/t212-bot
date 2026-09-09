@@ -92,6 +92,46 @@ def test_missing_size_unit_defaults_to_money():
     assert proposal.quantity is None
 
 
+def test_a_reply_cut_off_mid_field_keeps_what_arrived():
+    # Verbatim shape of the failures seen in production: a reasoning model
+    # spends its token budget thinking and stops part-way through the JSON.
+    raw = '{\n  "action": "sell",\n  "ticker": "VUAGl_EQ",\n  "notional_or_qty": 10.0,'
+    proposal = parse_proposal(raw)
+    assert proposal.action == "sell"
+    assert proposal.ticker == "VUAGl_EQ"
+    assert proposal.notional == dec(10)
+    assert "truncated" in proposal.reasoning
+
+
+def test_a_reply_cut_off_before_the_size_keeps_the_action_but_no_size():
+    raw = '{\n  "action": "buy",\n  "ticker": "VUSAl_EQ",\n  "notional'
+    proposal = parse_proposal(raw)
+    assert proposal.action == "buy"
+    assert proposal.ticker == "VUSAl_EQ"
+    # Nothing is invented: with no size the risk manager rejects it (R12).
+    assert proposal.notional is None
+    assert proposal.quantity is None
+
+
+def test_a_recovered_reply_never_invents_a_confidence():
+    raw = '{"action": "buy", "ticker": "VUSAl_EQ", "notional_or_qty": 5,'
+    assert parse_proposal(raw).confidence == dec(0)
+
+
+def test_a_fragment_with_no_object_start_is_not_salvaged():
+    # A tail of a reasoning trace, with no opening brace: acting on it would
+    # mean trading on the model's scratch work rather than its answer.
+    raw = 'VUSAl_EQ",\n  "notional_or_qty": 6.00,\n  "size_unit": "gbp",\n  "price'
+    proposal = parse_proposal(raw)
+    assert proposal.action == "hold"
+    assert "unparseable" in proposal.reasoning
+
+
+def test_a_complete_object_is_not_flagged_as_recovered():
+    raw = json.dumps({"action": "hold", "reasoning": "nothing doing"})
+    assert parse_proposal(raw).reasoning == "nothing doing"
+
+
 def test_unparseable_output_becomes_a_hold():
     proposal = parse_proposal("I'm afraid I can't help with that.")
     assert proposal.action == "hold"
@@ -311,6 +351,50 @@ def test_openrouter_retries_without_json_mode_on_a_400():
     # It remembers, so a second call skips structured mode entirely.
     provider.complete("s", "u")
     assert calls == [True, False, False]
+
+
+def _truncated_body(content: str | None, reasoning: str | None = None) -> dict:
+    message: dict = {"content": content}
+    if reasoning is not None:
+        message["reasoning"] = reasoning
+    return {"choices": [{"message": message, "finish_reason": "length"}]}
+
+
+def test_openrouter_retries_with_a_bigger_budget_when_it_runs_out_of_tokens():
+    budgets = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = _json.loads(request.content)
+        budgets.append(body["max_tokens"])
+        if len(budgets) == 1:
+            return httpx.Response(200, json=_truncated_body('{"action": "buy"'))
+        return httpx.Response(200, json=_ok_body())
+
+    provider = OpenRouterProvider(
+        api_key="k",
+        models=["m/free"],
+        max_tokens=1024,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert provider.complete("s", "u") == '{"action": "hold", "confidence": 1}'
+    assert budgets == [1024, 4096]
+
+
+def test_openrouter_returns_the_truncated_text_when_the_bigger_budget_also_runs_out():
+    # Better a salvageable fragment than nothing: parse_proposal recovers the
+    # fields that did arrive.
+    handler = lambda r: httpx.Response(  # noqa: E731
+        200, json=_truncated_body('{"action": "sell", "ticker": "X_EQ",')
+    )
+    provider = _provider(handler, ["m/free"])
+    assert provider.complete("s", "u").startswith('{"action": "sell"')
+    assert provider.last_http_calls == 2
+
+
+def test_openrouter_names_the_token_ceiling_when_nothing_at_all_came_back():
+    provider = _provider(lambda r: httpx.Response(200, json=_truncated_body(None)), ["m/free"])
+    with pytest.raises(ProviderError, match="ran out of tokens"):
+        provider.complete("s", "u")
 
 
 def test_extract_json_strips_a_reasoning_trace():

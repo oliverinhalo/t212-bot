@@ -83,7 +83,7 @@ the audit log, and each is asserted in `tests/test_risk_manager.py`.
 | 5 | **Trade-frequency cap.** `max_trades_per_day` (default 5), counting attempts, not fills | `R10_FREQUENCY` | `risk_manager.evaluate` |
 | 6 | **Ticker allow-list.** With `risk.enforce_allowlist: true` (default) the AI can only act on watch-list tickers. With it `false` (open-universe) the AI may name any instrument, but it must resolve against the Trading212 catalogue — a hallucinated ticker is still rejected before the broker | `R05_ALLOWLIST` | `risk_manager.evaluate` |
 | 7 | **No leverage, no shorting, no options.** Structurally: the client has no method that could express one, and a sell is clamped to the quantity actually held | `R18_NO_POSITION` | `t212_client`, `risk_manager._size_sell` |
-| 8 | **Every proposal is sanity-checked.** Unknown ticker, missing/stale/zero quote, implied price far from the market, low confidence, or any cap breach → rejected or shrunk | `R05`–`R17` | `risk_manager.evaluate` |
+| 8 | **Every proposal is sanity-checked.** Unknown ticker, missing/stale/zero quote, implied price far from the market, low confidence, or any cap breach → rejected or shrunk | `R05`–`R19` | `risk_manager.evaluate` |
 | 9 | **Duplicate-order guard.** One decision id claims at most one order row, written to SQLite *before* the HTTP call. Survives retries and crashes | `R03_DUPLICATE` | `storage.reserve_order` |
 | 10 | **Kill switch.** A `STOP` file halts every cycle cleanly | — | `main.run_cycle` |
 | 11 | **Full audit log.** Snapshot, prompt, raw response, verdict, reasoning, order and fill — all in SQLite | — | `storage.py` |
@@ -279,7 +279,8 @@ Key caps, with their defaults for £50 of capital:
 | `risk.daily_loss_limit_pct` | 10% | Breaker at −£5 |
 | `risk.max_trades_per_day` | 5 | Attempts, not fills |
 | `risk.max_price_deviation_pct` | 2% | AI's implied price vs the quote |
-| `risk.max_quote_age_seconds` | 900 | Older quotes block all trading |
+| `risk.max_quote_age_seconds` | 900 | How long ago *we* fetched the quote; 0 disables |
+| `risk.max_quote_delay_seconds` | 0 (off) | How far behind the exchange the feed's own timestamp may be |
 | `risk.min_confidence` | 0.60 | Below this, treated as hold |
 | `execution.quantity_decimals` | 6 | Quantities always round **down** |
 
@@ -459,9 +460,16 @@ Worth knowing before you trust this with money.
 - **Pence vs pounds.** London-listed ETFs quote in pence (`GBp`). The market
   data layer converts to GBP explicitly; getting this wrong would be a
   factor-of-100 error in every cap.
-- **Quote freshness is a trading gate.** With `max_quote_age_seconds: 900`, a
-  stale quote blocks all trading (`R07_QUOTE_STALE`). Outside market hours,
-  quotes go stale and nothing trades even with `--force`. That is intentional.
+- **Quote freshness is a trading gate, but feed delay is not.** These are two
+  different clocks and conflating them used to block every order.
+  `max_quote_age_seconds` measures how long ago *the bot fetched* the quote —
+  it catches our own market data stalling (`R07_QUOTE_STALE`).
+  `max_quote_delay_seconds` measures how far behind the exchange the feed's own
+  timestamp is; Yahoo is delayed ~15 minutes, so a quote pulled a second ago is
+  permanently ~900s "old" by that measure. It is off (`0`) by default — set it
+  to `900` to refuse to trade on a delayed feed (`R19_QUOTE_DELAYED`). Either
+  limit is disabled with `0`. Trading outside market hours is gated separately,
+  by `schedule.market_open`/`market_close`.
 - **Endpoint paths** follow the documented `/api/v0/equity/...` shapes. Verify
   against demo before live; `check_auth` exercises the account and portfolio
   endpoints, and a `--once` demo cycle exercises the order path.

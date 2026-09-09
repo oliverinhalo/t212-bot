@@ -85,9 +85,22 @@ class Quote:
     # manager and every capital check use ``price`` (always the GBP value).
     native_currency: str = ""
     native_price: Decimal | None = None
+    # When *we* obtained this quote, as opposed to ``as_of``, which is the
+    # exchange timestamp the feed reports. The two are different things: a
+    # 15-minute-delayed feed hands us a quote whose ``as_of`` is always ~900s
+    # in the past even though we fetched it a second ago. Freshness of our own
+    # data pipeline is measured from here; the feed's delay is measured from
+    # ``as_of``. Defaults to ``as_of`` so a quote built without it behaves
+    # exactly as it did before.
+    fetched_at: datetime | None = None
 
     def age_seconds(self, now: datetime | None = None) -> float:
+        """Seconds between the exchange timestamp and ``now`` — the feed delay."""
         return ((now or utcnow()) - self.as_of).total_seconds()
+
+    def staleness_seconds(self, now: datetime | None = None) -> float:
+        """Seconds since *we* fetched this quote — how stale our own copy is."""
+        return ((now or utcnow()) - (self.fetched_at or self.as_of)).total_seconds()
 
 
 @dataclass(frozen=True)

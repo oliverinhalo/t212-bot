@@ -140,6 +140,35 @@ def test_stale_quote_blocks_the_trade(config):
     assert verdict.rule == "R07_QUOTE_STALE"
 
 
+def test_a_freshly_fetched_quote_from_a_delayed_feed_is_tradeable(config):
+    # The free feed is ~15 minutes behind the exchange, so as_of is always old
+    # even though the quote was pulled a second ago. That is the feed's delay,
+    # not our data going stale, and it must not block trading.
+    inputs = make_inputs(
+        quotes={TICKER: make_quote(age_seconds=1000, fetched_seconds_ago=1)}
+    )
+    verdict = evaluate(buy(), inputs, config)
+    assert verdict.approved, verdict.reason
+
+
+def test_a_zero_age_limit_disables_the_staleness_check(config):
+    config = make_config(max_quote_age_seconds=0)
+    inputs = make_inputs(quotes={TICKER: make_quote(age_seconds=100_000)})
+    verdict = evaluate(buy(), inputs, config)
+    assert verdict.approved, verdict.reason
+
+
+def test_feed_delay_is_only_gated_when_a_delay_limit_is_configured(config):
+    quotes = {TICKER: make_quote(age_seconds=1000, fetched_seconds_ago=1)}
+
+    assert evaluate(buy(), make_inputs(quotes=quotes), config).approved
+
+    strict = make_config(max_quote_delay_seconds=900)
+    verdict = evaluate(buy(), make_inputs(quotes=quotes), strict)
+    assert not verdict.approved
+    assert verdict.rule == "R19_QUOTE_DELAYED"
+
+
 def test_zero_price_quote_blocks_the_trade(config):
     inputs = make_inputs(quotes={TICKER: make_quote(price=0)})
     verdict = evaluate(buy(), inputs, config)

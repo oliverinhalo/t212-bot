@@ -36,8 +36,18 @@ risk:
   # more than this %. Guards against stale/hallucinated prices.
   max_price_deviation_pct: 2.0
 
-  # Quotes older than this are treated as missing, and no order is approved.
+  # How long ago the bot may have *fetched* a quote and still trade on it. This
+  # measures our own market data going stale (the feed stopped answering, a
+  # cached quote is being reused), not how far behind the exchange the feed is.
+  # 0 disables the check.
   max_quote_age_seconds: 1800
+
+  # How far behind the market a quote's own exchange timestamp may be. Free
+  # feeds (Yahoo) are delayed ~15 minutes as a matter of course, so a freshly
+  # fetched LSE quote is always ~900s "old" by this measure — which used to
+  # block every order (R07_QUOTE_STALE). 0 (the default) accepts a delayed
+  # feed; set it to e.g. 900 to refuse to trade on one.
+  max_quote_delay_seconds: 0
 
   # Proposals below this confidence are downgraded to hold.
   min_confidence: 0.10
@@ -90,7 +100,9 @@ ai:
   #   stub      — deterministic "hold", for testing the pipeline with no API calls.
   provider: omniroute
   timeout_seconds: 60
-  max_tokens: 1024
+  # Reasoning models spend most of this thinking before writing a single
+  # character of the answer. Too small and the JSON arrives cut off mid-field.
+  max_tokens: 4096
 
   # Stop calling OpenRouter after this many HTTP calls in a UTC day (free tier
   # is ~50/day). Past this the local rule-based strategy takes over.
