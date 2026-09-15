@@ -460,3 +460,59 @@ def test_signals_appear_in_the_prompt_when_supplied():
     assert "TECHNICAL SIGNALS" in prompt
     assert "MARKET REGIME: risk on" in prompt
     assert "trend " in prompt
+
+
+def test_a_server_error_is_retried_once_without_structured_output():
+    # The production case: an OmniRoute instance answering every model slug
+    # with a bare "HTTP 500: Internal Server Error". A router that does not
+    # implement response_format does not always say so with a 400.
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = _json.loads(request.content)
+        bodies.append("response_format" in body)
+        if len(bodies) == 1:
+            return httpx.Response(500, text="Internal Server Error")
+        return httpx.Response(200, json=_ok_body())
+
+    provider = _provider(handler, ["m/free"])
+    assert provider.complete("s", "u") == '{"action": "hold", "confidence": 1}'
+    assert bodies == [True, False]
+    assert provider.last_http_calls == 2
+
+
+def test_a_second_server_error_gives_up_on_that_model():
+    provider = _provider(
+        lambda r: httpx.Response(500, text="Internal Server Error"), ["m/free"]
+    )
+    with pytest.raises(ProviderError, match="HTTP 500"):
+        provider.complete("s", "u")
+    # One attempt, one retry, then on to the next model — not a loop.
+    assert provider.last_http_calls == 2
+
+
+def test_a_server_error_does_not_mark_the_model_as_json_incapable():
+    # A 500 says nothing definite about what the model supports, so the next
+    # call still asks for structured output. Only a 400 is remembered.
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = _json.loads(request.content)
+        calls.append("response_format" in body)
+        if len(calls) == 1:
+            return httpx.Response(500, text="Internal Server Error")
+        return httpx.Response(200, json=_ok_body())
+
+    provider = _provider(handler, ["m/free"])
+    provider.complete("s", "u")
+    provider.complete("s", "u")
+    assert calls == [True, False, True]
+
+
+def test_every_model_failing_with_500_still_names_the_status():
+    provider = _provider(
+        lambda r: httpx.Response(500, text="Internal Server Error"), ["a/free", "b/free"]
+    )
+    with pytest.raises(ProviderError, match="every OpenRouter model failed"):
+        provider.complete("s", "u")
+    assert provider.last_http_calls == 4  # two models, one retry each

@@ -242,10 +242,12 @@ class OpenRouterProvider:
             body["response_format"] = {"type": "json_object"}
 
         bumped = False
-        # Two retries are possible and independent: one to drop structured-output
-        # mode, one to raise the token ceiling. Four passes covers both plus the
-        # request that finally answers.
-        for _ in range(4):
+        retried_5xx = False
+        # Three retries are possible and independent: one to drop
+        # structured-output mode, one for a server-side error, one to raise the
+        # token ceiling. Five passes covers all three plus the request that
+        # finally answers.
+        for _ in range(5):
             self.last_http_calls += 1
             try:
                 response = self._http.post(
@@ -264,6 +266,24 @@ class OpenRouterProvider:
                 continue
             if response.status_code == 429:
                 raise ProviderError("rate limit (free tier is ~20/min, ~50/day)")
+            if response.status_code >= 500 and not retried_5xx:
+                # A 5xx is the server's problem rather than the request's, and
+                # one more attempt costs a single call. Drop structured output
+                # for the retry: a router that does not implement it does not
+                # always have the manners to say so with a 400. Unlike the 400
+                # path this is not remembered — a 5xx says nothing definite
+                # about what the model supports.
+                retried_5xx = True
+                dropped = body.pop("response_format", None) is not None
+                log.warning(
+                    "%s model %s returned HTTP %d (%s); retrying once%s",
+                    self._error_label,
+                    model,
+                    response.status_code,
+                    response.text[:120].strip() or "no body",
+                    " without structured output" if dropped else "",
+                )
+                continue
             if response.status_code >= 400:
                 raise ProviderError(f"HTTP {response.status_code}: {response.text[:300]}")
 
