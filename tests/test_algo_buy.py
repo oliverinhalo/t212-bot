@@ -66,6 +66,13 @@ def test_an_empty_universe_file_refuses(tmp_path):
         load_universe(str(path))
 
 
+def test_a_universe_file_that_does_not_exist_fails_cleanly(tmp_path):
+    missing = tmp_path / "does_not_exist.txt"
+
+    with pytest.raises(SystemExit, match="could not read"):
+        load_universe(str(missing))
+
+
 # --------------------------------------------------------------------------- #
 # passes_filter
 # --------------------------------------------------------------------------- #

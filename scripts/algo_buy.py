@@ -127,7 +127,11 @@ def load_universe(path: str | None) -> list[tuple[str, str, str]]:
     """
     if not path:
         return list(DEFAULT_UNIVERSE)
-    lines = [ln.strip() for ln in Path(path).read_text().splitlines()]
+    try:
+        text = Path(path).read_text()
+    except OSError as exc:
+        raise SystemExit(f"!! could not read {path}: {exc}") from exc
+    lines = [ln.strip() for ln in text.splitlines()]
     tickers = [ln for ln in lines if ln and not ln.startswith("#")]
     if not tickers:
         raise SystemExit(f"!! {path} has no tickers (one per line).")
