@@ -20,13 +20,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from decimal import ROUND_FLOOR, Decimal
 
 from t212bot.config import ConfigError, load
 from t212bot.fx import FxConverter, FxError
-from t212bot.instruments import InstrumentCatalogue
-from t212bot.market_data import MarketDataError, YahooMarketData
+from t212bot.instruments import Instrument, InstrumentCatalogue, instrument_from_row
+from t212bot.market_data import MarketDataError, YahooMarketData, yahoo_symbol_for
 from t212bot.models import ZERO, money
 from t212bot.t212_client import (
     T212APIError,
@@ -45,38 +46,74 @@ def step(n: int, text: str) -> None:
     print(f"\n[{n}] {text}")
 
 
-def resolve_ticker(client: T212Client, config) -> str:
-    """The Trading212 ticker for the ISIN, from the cache or the API."""
+def _pick(candidates: list[Instrument]) -> Instrument:
+    """Prefer the US line, then GBP, then whatever came first.
+
+    One ISIN, several exchanges. The US listing is the one most people mean by
+    "NVIDIA", and it is the deepest market; a GBP line at least avoids an FX
+    leg. Everything is printed, so a surprising pick is visible rather than
+    silent.
+    """
+    for wanted in ("_US_EQ",):
+        for inst in candidates:
+            if inst.ticker.endswith(wanted):
+                return inst
+    for inst in candidates:
+        if inst.currency.upper() in ("GBP", "GBX"):
+            return inst
+    return candidates[0]
+
+
+def resolve_instrument(client: T212Client, config) -> Instrument:
+    """Every listing of the ISIN this account can trade, and the chosen one."""
     catalogue = InstrumentCatalogue.load(config.instruments_path)
+    candidates: list[Instrument] = []
     if catalogue is not None:
-        found = catalogue.resolve(NVIDIA_ISIN)
-        if found is not None:
-            print(f"    found in {config.instruments_path}: {found.ticker} ({found.name})")
-            return found.ticker
-        print(f"    {config.instruments_path} has no {NVIDIA_ISIN}; asking the API")
-    else:
-        print(f"    no cached catalogue at {config.instruments_path}; asking the API")
+        candidates = catalogue.matching_isin(NVIDIA_ISIN)
+        print(f"    {config.instruments_path}: {len(candidates)} listing(s) of {NVIDIA_ISIN}")
 
-    rows = client.instruments()
-    print(f"    the API lists {len(rows)} instruments")
-    for row in rows:
-        if str(row.get("isin", "")).upper() == NVIDIA_ISIN:
-            ticker = str(row.get("ticker", ""))
-            print(f"    matched ISIN {NVIDIA_ISIN}: {ticker} ({row.get('name')})")
-            print(f"    currency {row.get('currencyCode')}, type {row.get('type')}")
-            return ticker
-    raise SystemExit(
-        f"!! {NVIDIA_ISIN} is not in this account's tradable universe.\n"
-        "   That usually means the key belongs to a different Trading212 "
-        "environment than the one you are looking at in the app."
-    )
+    if not candidates:
+        print("    not in the local catalogue; asking the API")
+        rows = client.instruments()
+        print(f"    the API lists {len(rows)} instruments")
+        candidates = [
+            inst
+            for inst in (instrument_from_row(row) for row in rows)
+            if inst is not None and inst.isin.upper() == NVIDIA_ISIN
+        ]
+
+    if not candidates:
+        raise SystemExit(
+            f"!! {NVIDIA_ISIN} is not in this account's tradable universe.\n"
+            "   That usually means the key belongs to a different Trading212 "
+            "environment than the one you are looking at in the app.\n"
+            "   Refresh the catalogue with: python -m scripts.list_instruments --refresh"
+        )
+
+    for inst in candidates:
+        print(f"      {inst.ticker:<14} {inst.currency:<4} {inst.type:<6} {inst.name}")
+    chosen = _pick(candidates)
+    print(f"    using {chosen.ticker} ({chosen.currency})")
+    if not chosen.ticker.endswith("_US_EQ"):
+        print(
+            "    note: this is not the US line. Same company, different exchange"
+            " and currency."
+        )
+    return chosen
 
 
-def gbp_price(ticker: str) -> Decimal:
-    """What one share costs in GBP, via Yahoo plus an FX rate."""
+def gbp_price(instrument: Instrument) -> Decimal:
+    """What one share of *this listing* costs in GBP.
+
+    The Yahoo symbol comes from the instrument's own ticker suffix, so a German
+    line is priced in EUR off the German feed rather than in USD off NASDAQ.
+    """
+    symbol = yahoo_symbol_for(instrument) or NVIDIA_YAHOO
+    print(f"    {instrument.ticker} -> Yahoo symbol {symbol}")
+
     market = YahooMarketData()
     try:
-        quote, _ = market.fetch_symbol(ticker, NVIDIA_YAHOO, history_days=5)
+        quote, _ = market.fetch_symbol(instrument.ticker, symbol, history_days=5)
     finally:
         market.close()
     print(f"    Yahoo: {quote.price} {quote.currency}")
@@ -92,6 +129,37 @@ def gbp_price(ticker: str) -> Decimal:
     price = quote.price / rate
     print(f"    FX: {rate} {quote.currency} per GBP  ->  {money(price)} GBP per share")
     return price
+
+
+_PRECISION_RE = re.compile(r"precision\s+(\d+)")
+
+
+def place(client: T212Client, ticker: str, quantity: Decimal, price: Decimal) -> dict:
+    """Place the order, and re-round once if the broker names a precision.
+
+    Trading212 rejects a quantity with more decimal places than the instrument
+    allows ("invalid quantity precision 4") and the allowance is not in the
+    public metadata, so the refusal itself is the only place it is stated.
+    Re-rounding *down* to what it asked for and trying again spends no more
+    money than the first attempt. A 400 is a definite refusal — no order was
+    created — so this is not the retry of an order whose fate is unknown.
+    """
+    try:
+        return client.place_market_order(ticker, quantity)
+    except T212APIError as exc:
+        match = _PRECISION_RE.search(exc.body or "")
+        if not match or "precision" not in (exc.body or ""):
+            raise
+        places = int(match.group(1))
+        retried = quantity.quantize(Decimal(1).scaleb(-places), rounding=ROUND_FLOOR)
+        print(f"    broker wants {places} dp: {quantity} -> {retried}")
+        if retried <= ZERO:
+            raise SystemExit(
+                f"!! at {places} dp the order rounds to nothing. "
+                f"Raise --amount: one share is {money(price)}."
+            ) from exc
+        print(f"    retrying: BUY {retried} {ticker} (~{money(retried * price)})")
+        return client.place_market_order(ticker, retried)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -151,10 +219,18 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
             step(2, f"resolving {NVIDIA_ISIN}")
-            ticker = args.ticker or resolve_ticker(client, config)
+            if args.ticker:
+                instrument = Instrument(
+                    ticker=args.ticker, name=NVIDIA_NAME, short_name=NVIDIA_YAHOO,
+                    isin=NVIDIA_ISIN, currency="", type="STOCK",
+                )
+                print(f"    using {args.ticker} as given")
+            else:
+                instrument = resolve_instrument(client, config)
+            ticker = instrument.ticker
 
             step(3, "pricing one share")
-            price = gbp_price(ticker)
+            price = gbp_price(instrument)
 
             step(4, "sizing the order")
             step_size = Decimal(1).scaleb(-config.execution.quantity_decimals)
@@ -174,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("    --dry-run: nothing sent.")
                 return 0
 
-            response = client.place_market_order(ticker, quantity)
+            response = place(client, ticker, quantity, price)
             print("    the broker replied:")
             print(json.dumps(response, indent=6, default=str))
 

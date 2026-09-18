@@ -37,7 +37,7 @@ class Instrument:
         return self.type in ("STOCK", "ETF")
 
 
-def _instrument_from_row(row: dict) -> Instrument | None:
+def instrument_from_row(row: dict) -> Instrument | None:
     ticker = str(row.get("ticker", "")).strip()
     if not ticker:
         return None
@@ -80,7 +80,7 @@ class InstrumentCatalogue:
             log.error("could not read instrument catalogue %s: %s", path, exc)
             return None
         instruments = [
-            inst for inst in (_instrument_from_row(r) for r in rows) if inst is not None
+            inst for inst in (instrument_from_row(r) for r in rows) if inst is not None
         ]
         log.info("loaded %d instruments from %s", len(instruments), path)
         return cls(instruments)
@@ -88,6 +88,19 @@ class InstrumentCatalogue:
     def get(self, ticker: str) -> Instrument | None:
         """Exact Trading212-ticker lookup."""
         return self._by_ticker.get((ticker or "").strip())
+
+    def matching_isin(self, isin: str) -> list[Instrument]:
+        """Every listing of one ISIN, not just the first one indexed.
+
+        ``resolve`` answers with a single instrument, which is what a trading
+        decision needs. Choosing *which* listing of a company to buy is a
+        different question — the same ISIN appears on several exchanges in
+        several currencies — and needs the whole set.
+        """
+        needle = (isin or "").strip().upper()
+        if not needle:
+            return []
+        return [i for i in self._by_ticker.values() if i.isin.upper() == needle]
 
     def resolve(self, query: str) -> Instrument | None:
         """Best-effort resolution of whatever the AI named.
@@ -129,4 +142,4 @@ class InstrumentCatalogue:
         return None
 
 
-__all__ = ["Instrument", "InstrumentCatalogue"]
+__all__ = ["Instrument", "InstrumentCatalogue", "instrument_from_row"]
