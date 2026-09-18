@@ -20,15 +20,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
-from decimal import ROUND_FLOOR, Decimal
+from decimal import Decimal
 
 from t212bot.config import ConfigError, load
-from t212bot.fx import FxConverter, FxError
+from t212bot.fx import FxError
 from t212bot.instruments import Instrument, InstrumentCatalogue, instrument_from_row
 from t212bot.market_data import MarketDataError, YahooMarketData, yahoo_symbol_for
 from t212bot.models import ZERO, money
+from t212bot.quickbuy import place_with_precision_retry, size_order, to_gbp
 from t212bot.t212_client import (
     T212APIError,
     T212AuthError,
@@ -117,49 +117,7 @@ def gbp_price(instrument: Instrument) -> Decimal:
     finally:
         market.close()
     print(f"    Yahoo: {quote.price} {quote.currency}")
-
-    if quote.currency.upper() == "GBP":
-        return quote.price
-
-    fx = FxConverter()
-    try:
-        rate = fx.rate(quote.currency)
-    finally:
-        fx.close()
-    price = quote.price / rate
-    print(f"    FX: {rate} {quote.currency} per GBP  ->  {money(price)} GBP per share")
-    return price
-
-
-_PRECISION_RE = re.compile(r"precision\s+(\d+)")
-
-
-def place(client: T212Client, ticker: str, quantity: Decimal, price: Decimal) -> dict:
-    """Place the order, and re-round once if the broker names a precision.
-
-    Trading212 rejects a quantity with more decimal places than the instrument
-    allows ("invalid quantity precision 4") and the allowance is not in the
-    public metadata, so the refusal itself is the only place it is stated.
-    Re-rounding *down* to what it asked for and trying again spends no more
-    money than the first attempt. A 400 is a definite refusal — no order was
-    created — so this is not the retry of an order whose fate is unknown.
-    """
-    try:
-        return client.place_market_order(ticker, quantity)
-    except T212APIError as exc:
-        match = _PRECISION_RE.search(exc.body or "")
-        if not match or "precision" not in (exc.body or ""):
-            raise
-        places = int(match.group(1))
-        retried = quantity.quantize(Decimal(1).scaleb(-places), rounding=ROUND_FLOOR)
-        print(f"    broker wants {places} dp: {quantity} -> {retried}")
-        if retried <= ZERO:
-            raise SystemExit(
-                f"!! at {places} dp the order rounds to nothing. "
-                f"Raise --amount: one share is {money(price)}."
-            ) from exc
-        print(f"    retrying: BUY {retried} {ticker} (~{money(retried * price)})")
-        return client.place_market_order(ticker, retried)
+    return to_gbp(quote.price, quote.currency)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -233,8 +191,7 @@ def main(argv: list[str] | None = None) -> int:
             price = gbp_price(instrument)
 
             step(4, "sizing the order")
-            step_size = Decimal(1).scaleb(-config.execution.quantity_decimals)
-            quantity = (args.amount / price).quantize(step_size, rounding=ROUND_FLOOR)
+            quantity = size_order(args.amount, price, config.execution.quantity_decimals)
             print(f"    {money(args.amount)} / {money(price)} = {quantity} shares"
                   f" (rounded down to {config.execution.quantity_decimals} dp)")
             if quantity <= ZERO:
@@ -250,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("    --dry-run: nothing sent.")
                 return 0
 
-            response = place(client, ticker, quantity, price)
+            response = place_with_precision_retry(client, ticker, quantity, price)
             print("    the broker replied:")
             print(json.dumps(response, indent=6, default=str))
 

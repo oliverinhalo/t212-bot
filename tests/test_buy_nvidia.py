@@ -1,22 +1,10 @@
-"""The standalone NVIDIA buy script: listing choice and precision handling."""
+"""The standalone NVIDIA buy script: listing choice and symbol derivation."""
 
 from __future__ import annotations
 
-from decimal import Decimal
-
-import pytest
-
-from scripts.buy_nvidia import NVIDIA_ISIN, _pick, place
+from scripts.buy_nvidia import NVIDIA_ISIN, _pick
 from t212bot.instruments import Instrument, InstrumentCatalogue
 from t212bot.market_data import yahoo_symbol_for
-from t212bot.models import dec
-from t212bot.t212_client import T212APIError
-
-PRECISION_BODY = (
-    '{"type":"/api-errors/quantity-precision-mismatch",'
-    '"title":"Error while placing the order","status":400,'
-    '"detail":"invalid quantity precision 4","traceId":"60d01e4e"}'
-)
 
 
 def _instrument(ticker: str, currency: str) -> Instrument:
@@ -24,66 +12,6 @@ def _instrument(ticker: str, currency: str) -> Instrument:
         ticker=ticker, name="Nvidia", short_name="NVDA",
         isin=NVIDIA_ISIN, currency=currency, type="STOCK",
     )
-
-
-class FakeClient:
-    """Refuses anything over ``max_dp`` the way Trading212 does."""
-
-    def __init__(self, max_dp: int | None = 4):
-        self.calls: list[Decimal] = []
-        self._max_dp = max_dp
-
-    def place_market_order(self, ticker: str, quantity: Decimal):
-        self.calls.append(quantity)
-        if self._max_dp is not None and -quantity.as_tuple().exponent > self._max_dp:
-            raise T212APIError(400, PRECISION_BODY, "/equity/orders/market")
-        return {"id": 1, "status": "FILLED", "ticker": ticker, "filledQuantity": quantity}
-
-
-# --------------------------------------------------------------------------- #
-# Quantity precision
-# --------------------------------------------------------------------------- #
-
-
-def test_precision_refusal_is_retried_at_the_precision_the_broker_named() -> None:
-    client = FakeClient(max_dp=4)
-
-    response = place(client, "NVDA_US_EQ", dec("0.030383"), dec("164.57"))
-
-    assert response["status"] == "FILLED"
-    # Rounded DOWN to 4 dp, so the retry never spends more than the first try.
-    assert client.calls == [dec("0.030383"), dec("0.0303")]
-
-
-def test_a_quantity_the_broker_accepts_is_not_retried() -> None:
-    client = FakeClient(max_dp=4)
-    place(client, "NVDA_US_EQ", dec("0.0303"), dec("164.57"))
-    assert client.calls == [dec("0.0303")]
-
-
-def test_an_amount_too_small_for_that_precision_says_so() -> None:
-    """£0.01 of a £164 share is 0.00006 — nothing at all once rounded to 4 dp."""
-    client = FakeClient(max_dp=4)
-
-    with pytest.raises(SystemExit, match="rounds to nothing"):
-        place(client, "NVDA_US_EQ", dec("0.000060"), dec("164.57"))
-
-    assert len(client.calls) == 1  # the retry was never sent
-
-
-def test_a_refusal_that_is_not_about_precision_is_not_retried() -> None:
-    class Broke:
-        def __init__(self):
-            self.calls = 0
-
-        def place_market_order(self, ticker, quantity):
-            self.calls += 1
-            raise T212APIError(400, '{"detail":"insufficient funds"}', "/equity/orders/market")
-
-    client = Broke()
-    with pytest.raises(T212APIError):
-        place(client, "NVDA_US_EQ", dec("0.03"), dec("164.57"))
-    assert client.calls == 1
 
 
 # --------------------------------------------------------------------------- #
