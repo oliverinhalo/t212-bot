@@ -374,13 +374,25 @@ class SymbolResolver:
 
     @staticmethod
     def _derive(instrument: Instrument) -> str | None:
-        if not instrument.short_name:
-            return None
-        for suffix, yahoo_suffix in _T212_SUFFIX_TO_YAHOO.items():
-            if instrument.ticker.endswith(suffix):
-                base = re.sub(r"[^A-Za-z0-9.\-]", "", instrument.short_name)
-                return f"{base}{yahoo_suffix}" if base else None
+        return yahoo_symbol_for(instrument)
+
+
+def yahoo_symbol_for(instrument: Instrument) -> str | None:
+    """Yahoo symbol for this instrument's *own* listing, from its ticker suffix.
+
+    Deliberately venue-specific. One ISIN can be listed in several places —
+    NVDA_US_EQ and NVDd_EQ are both Nvidia under US67066G1040 — and they trade
+    on different exchanges in different currencies, so pricing one from the
+    other's feed is wrong by the FX rate between them. An ISIN lookup cannot
+    tell them apart; the ticker suffix can.
+    """
+    if not instrument.short_name:
         return None
+    for suffix, yahoo_suffix in _T212_SUFFIX_TO_YAHOO.items():
+        if instrument.ticker.endswith(suffix):
+            base = re.sub(r"[^A-Za-z0-9.\-]", "", instrument.short_name)
+            return f"{base}{yahoo_suffix}" if base else None
+    return None
 
 
 def build_provider(config) -> MarketDataProvider:

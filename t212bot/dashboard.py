@@ -25,8 +25,11 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify, render_template_string, request
 
 from .config import AppConfig, load
-from .models import ZERO, dec, money
+from .indicators import compute_all
+from .models import ZERO, Verdict, dec, money
 from .main import build_runtime, safe_cycle, trading_day
+from .portfolio import load_account_state
+from .risk_manager import floor_quantity
 from .storage import Storage
 
 log = logging.getLogger(__name__)
@@ -124,6 +127,17 @@ PAGE = """
       ⚡ Force trade cycle
     </button>
     <div id="force-result"></div>
+
+    <h2 style="margin-top:1.2rem">Buy now</h2>
+    <p class="muted" style="margin:.2rem 0 .6rem">
+      Buys &pound;{{ quick_buy_amount }} of whichever watch-list instrument the
+      local signals rank highest, immediately.
+      <strong>No AI, no caps, no confidence gate, no market-hours gate.</strong>
+      Only the kill switch still stops it.</p>
+    <button class="force-btn" id="quick-buy-btn" onclick="quickBuy()">
+      💷 Buy &pound;{{ quick_buy_amount }} of the top pick
+    </button>
+    <div id="quick-buy-result"></div>
   </div>
 
   <h2>Open positions</h2>
@@ -203,6 +217,66 @@ PAGE = """
           btn.disabled = false;
           btn.textContent = '⚡ Force trade cycle';
         });
+    }
+
+    var quickPolling = null;
+    function quickBuy() {
+      var btn = document.getElementById('quick-buy-btn');
+      var res = document.getElementById('quick-buy-result');
+      var label = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '⏳ Buying…';
+      res.className = 'force-result running';
+      res.textContent = 'Placing order…';
+
+      fetch('/api/quick-buy', { method: 'POST' })
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          if (data.error) {
+            res.className = 'force-result err';
+            res.textContent = '✗ ' + data.error;
+            btn.disabled = false;
+            btn.textContent = label;
+            return;
+          }
+          pollQuickBuy(data.id, label);
+        })
+        .catch(function(err) {
+          res.className = 'force-result err';
+          res.textContent = '✗ Request failed: ' + err;
+          btn.disabled = false;
+          btn.textContent = label;
+        });
+    }
+
+    function pollQuickBuy(id, label) {
+      var btn = document.getElementById('quick-buy-btn');
+      var res = document.getElementById('quick-buy-result');
+      if (quickPolling) clearInterval(quickPolling);
+      quickPolling = setInterval(function() {
+        fetch('/api/quick-buy/status?id=' + id)
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            if (data.status === 'running') {
+              res.textContent = '⏳ Placing order…';
+              return;
+            }
+            clearInterval(quickPolling);
+            quickPolling = null;
+            btn.disabled = false;
+            btn.textContent = label;
+            if (data.status === 'done') {
+              var filled = data.order_state === 'filled' || data.order_state === 'accepted';
+              res.className = 'force-result ' + (filled ? 'ok' : 'err');
+              res.textContent = (filled ? '✓ ' : '⚠ ') + data.result +
+                                (data.error ? ' — ' + data.error : '');
+            } else {
+              res.className = 'force-result err';
+              res.textContent = '✗ ' + (data.error || 'unknown error');
+            }
+          })
+          .catch(function() { /* keep polling */ });
+      }, 2000);
     }
 
     function pollResult(id) {
@@ -319,6 +393,132 @@ def _run_force_cycle(run_id: str, config: AppConfig) -> None:
         log.exception("force-trade %s failed", run_id[:8])
 
 
+# --------------------------------------------------------------------------- #
+# Quick-buy: one click, a fixed amount, the top-ranked instrument
+# --------------------------------------------------------------------------- #
+
+_quick_buys: dict[str, dict] = {}
+
+
+def _top_ranked(config: AppConfig, snapshot) -> tuple[str, object]:
+    """The watch-list instrument the local signals rank highest, and its quote.
+
+    "Top recommended" without asking the model: the same trend score the local
+    strategy ranks entries by, over the instruments we have a live price for.
+    With no usable history at all, the first priced watch-list entry wins —
+    an arbitrary but predictable choice, rather than no answer.
+    """
+    priced = [item for item in config.watchlist if item.ticker in snapshot.quotes]
+    if not priced:
+        raise ExecutionRefused(f"no live price for any watch-list ticker: {snapshot.errors}")
+
+    signals = compute_all(
+        config.watchlist, snapshot.quotes, snapshot.histories, config.ai.indicators
+    )
+    ranked = sorted(
+        (s for t, s in signals.items() if t in snapshot.quotes),
+        key=lambda s: s.score,
+        reverse=True,
+    )
+    ticker = ranked[0].ticker if ranked else priced[0].ticker
+    return ticker, snapshot.quotes[ticker]
+
+
+class ExecutionRefused(Exception):
+    """The quick buy could not be turned into an order."""
+
+
+def _run_quick_buy(run_id: str, config: AppConfig) -> None:
+    """Buy ``dashboard.quick_buy_gbp`` of the top-ranked instrument, now.
+
+    This is the manual override: no AI call, no confidence gate, no capital or
+    position cap, no market-hours gate, no daily-trade budget. It still honours
+    the kill switch — a STOP file is an emergency brake, and a button that
+    ignored it would not be an override, it would be a bug — and it still goes
+    through the executor, so the order gets a duplicate guard and an audit row
+    like any other.
+    """
+    amount = config.dashboard.quick_buy_gbp
+    try:
+        if config.stop_file.exists():
+            raise ExecutionRefused(
+                f"kill switch is engaged ({config.stop_file}) — delete it to trade"
+            )
+
+        runtime = build_runtime(config)
+        try:
+            snapshot = runtime.market.fetch(config.watchlist, config.max_history_days)
+            ticker, quote = _top_ranked(config, snapshot)
+
+            quantity = floor_quantity(amount / quote.price, config)
+            if quantity <= ZERO:
+                raise ExecutionRefused(
+                    f"{money(amount)} does not buy a tradeable quantity of {ticker} "
+                    f"at {money(quote.price)}"
+                    + ("" if config.execution.fractional else " (whole shares only)")
+                )
+
+            notional = quantity * quote.price
+            decision_id = uuid.uuid4().hex
+            day = trading_day(config)
+            verdict = Verdict(
+                approved=True,
+                action="buy",
+                rule="MANUAL_QUICK_BUY",
+                reasons=(
+                    f"manual quick buy from the dashboard: {money(amount)} of {ticker} "
+                    f"at ~{quote.price} = {quantity} shares ({money(notional)}); "
+                    "risk checks bypassed by request",
+                ),
+                ticker=ticker,
+                quantity=quantity,
+                notional=notional,
+                reference_price=quote.price,
+            )
+
+            runtime.storage.start_cycle(decision_id, day, config.mode)
+            runtime.storage.record_verdict(decision_id, verdict)
+            log.warning(
+                "QUICK BUY: %s of %s at ~%s (%s shares) — checks bypassed",
+                money(amount),
+                ticker,
+                quote.price,
+                quantity,
+            )
+
+            record = runtime.executor.execute(
+                decision_id,
+                verdict,
+                day,
+                lambda: load_account_state(
+                    config, runtime.storage, runtime.client, snapshot.prices()
+                ),
+                skip_recheck=True,
+            )
+            state = record.state if record else "not-placed"
+            runtime.storage.finish_cycle(decision_id, "completed", f"quick buy {state}")
+        finally:
+            runtime.close()
+
+        with _force_lock:
+            _quick_buys[run_id] = {
+                "status": "done",
+                "result": f"{state}: {money(notional)} of {ticker}",
+                "ticker": ticker,
+                "order_state": state,
+                "error": record.error if record else None,
+            }
+        log.info("quick-buy %s finished: %s %s", run_id[:8], state, ticker)
+    except ExecutionRefused as exc:
+        with _force_lock:
+            _quick_buys[run_id] = {"status": "error", "error": str(exc)}
+        log.warning("quick-buy %s refused: %s", run_id[:8], exc)
+    except Exception as exc:  # noqa: BLE001 - must not crash the server thread
+        with _force_lock:
+            _quick_buys[run_id] = {"status": "error", "error": str(exc)}
+        log.exception("quick-buy %s failed", run_id[:8])
+
+
 def create_app(config: AppConfig | None = None) -> Flask:
     config = config or load()
     storage = Storage(config.storage.db_path)
@@ -331,6 +531,7 @@ def create_app(config: AppConfig | None = None) -> Flask:
             PAGE,
             config=config,
             cap=money(config.capital.max_capital),
+            quick_buy_amount=money(config.dashboard.quick_buy_gbp),
             **state,
         )
 
@@ -388,6 +589,35 @@ def create_app(config: AppConfig | None = None) -> Flask:
         if entry is None:
             return jsonify({"error": "Unknown force-trade id."}), 404
         return jsonify({"id": run_id, **entry})
+
+    @app.post("/api/quick-buy")
+    def quick_buy():
+        with _force_lock:
+            if any(t["status"] == "running" for t in _quick_buys.values()):
+                return jsonify({"error": "A quick buy is already running."}), 409
+            run_id = uuid.uuid4().hex
+            _quick_buys[run_id] = {"status": "running"}
+            if len(_quick_buys) > _MAX_HISTORY:
+                old = sorted(k for k, v in _quick_buys.items() if v["status"] != "running")
+                for k in old[: len(_quick_buys) - _MAX_HISTORY]:
+                    _quick_buys.pop(k, None)
+
+        threading.Thread(
+            target=_run_quick_buy,
+            args=(run_id, config),
+            name=f"quick-buy-{run_id[:8]}",
+            daemon=True,
+        ).start()
+        log.warning("quick-buy %s started from dashboard", run_id[:8])
+        return jsonify({"id": run_id, "status": "running"})
+
+    @app.get("/api/quick-buy/status")
+    def quick_buy_status():
+        with _force_lock:
+            entry = _quick_buys.get(request.args.get("id", ""))
+        if entry is None:
+            return jsonify({"error": "Unknown quick-buy id."}), 404
+        return jsonify(entry)
 
     @app.get("/healthz")
     def healthz():

@@ -200,6 +200,10 @@ class LoggingConfig:
 class DashboardConfig:
     host: str
     port: int
+    # What the dashboard's one-click "Buy £X now" button spends. It is a
+    # deliberate manual override: it skips the AI, the sizing caps and the
+    # confidence gate, so keep it small.
+    quick_buy_gbp: Decimal = Decimal(5)
 
 
 @dataclass(frozen=True)
@@ -662,7 +666,10 @@ def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env"
     dashboard = DashboardConfig(
         host=str(dash_raw.get("host", "127.0.0.1")),
         port=_int(dash_raw, "port", "dashboard", 8080),
+        quick_buy_gbp=_dec(dash_raw, "quick_buy_gbp", "dashboard", 5),
     )
+    if dashboard.quick_buy_gbp <= Decimal(0):
+        raise ConfigError("dashboard.quick_buy_gbp must be positive")
 
     stop_file = Path(str(_section(data, "kill_switch").get("stop_file", "./STOP")))
     watchlist = load_watchlist(data.get("watchlist"))
