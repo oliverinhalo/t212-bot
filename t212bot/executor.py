@@ -71,14 +71,21 @@ class Executor:
         trading_day: date,
         refresh_account: Callable[[], AccountState],
         preorder: bool = False,
+        skip_recheck: bool = False,
     ) -> OrderRecord | None:
         """Place the approved order, or return None if it never reached the market.
 
         ``preorder`` says the market is closed and the order should rest until
         it opens: a limit order with the configured time validity, rather than
         a market order the broker would refuse outright. It changes how the
-        order is placed, never whether it is allowed — the risk manager has
-        already decided that, and the pre-submit re-check below still runs.
+        order is placed, never whether it is allowed.
+
+        ``skip_recheck`` drops the pre-submit re-validation, for an order a
+        human asked for directly (the dashboard's quick-buy button) rather than
+        one the risk manager authorised. The duplicate-order guard and the
+        audit row are kept either way: those are not caution, they are what
+        stops one click becoming two orders and what makes the order findable
+        afterwards. Nothing in the scheduled path sets it.
         """
         if not verdict.approved or verdict.ticker is None:
             return None
@@ -94,17 +101,26 @@ class Executor:
             return existing
 
         # 2. Fresh balance, then re-run the risk manager against it.
-        try:
-            account = refresh_account()
-        except Exception as exc:  # noqa: BLE001 - cannot verify funds, so do not trade
-            self.storage.settle_order(
-                decision_id, STATE_CANCELLED, error=f"balance re-check failed: {exc}"
+        if skip_recheck:
+            log.warning(
+                "pre-submit re-check SKIPPED for %s (manual order: %s %s)",
+                decision_id,
+                verdict.side,
+                verdict.ticker,
             )
-            log.error("balance re-check failed for %s: %s", decision_id, exc)
-            return self.storage.get_order(decision_id)
+            checked = verdict
+        else:
+            try:
+                account = refresh_account()
+            except Exception as exc:  # noqa: BLE001 - cannot verify funds, so do not trade
+                self.storage.settle_order(
+                    decision_id, STATE_CANCELLED, error=f"balance re-check failed: {exc}"
+                )
+                log.error("balance re-check failed for %s: %s", decision_id, exc)
+                return self.storage.get_order(decision_id)
 
-        checked = revalidate(verdict, account, self.config)
-        self.storage.record_verdict(decision_id, checked, stage="pre_submit")
+            checked = revalidate(verdict, account, self.config)
+            self.storage.record_verdict(decision_id, checked, stage="pre_submit")
         if not checked.approved:
             self.storage.settle_order(
                 decision_id,
