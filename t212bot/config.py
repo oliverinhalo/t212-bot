@@ -11,8 +11,9 @@ something generous is exactly the failure this project cannot afford.
 
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping
@@ -30,6 +31,19 @@ DEFAULT_DEMO_BASE_URL = "https://demo.trading212.com/api/v0"
 DEFAULT_LIVE_BASE_URL = "https://live.trading212.com/api/v0"
 
 _WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+def crypto_overlay_paths(db_path: Path) -> tuple[Path, Path]:
+    """Where the dashboard's crypto settings form writes, relative to the
+    database — the same convention ``instruments_path`` already uses.
+
+    Not .env / config.yaml: both already sit outside the systemd dashboard
+    service's writable path (deploy/t212-bot-dashboard.service grants only
+    ``ReadWritePaths=.../data``, the same directory the database lives in),
+    and keeping the two version-controlled files untouched by a web form is
+    one less way a GUI edit could corrupt them.
+    """
+    data_dir = db_path.parent
+    return data_dir / "crypto_secrets.env", data_dir / "crypto_settings.json"
 
 
 class ConfigError(Exception):
@@ -139,6 +153,55 @@ class LocalStrategyConfig:
 
 
 @dataclass(frozen=True)
+class CryptoConfig:
+    """The crypto side: a second, independent market the dashboard can run.
+
+    Deliberately not the same risk machinery as the Trading212 side (no
+    circuit breaker, no shared capital pool) — it is its own small, separate
+    system with its own capital cap, position cap, and kill-switch check (the
+    same ``stop_file`` halts both). ``mode`` is independent of the top-level
+    ``MODE``: the stock side and the crypto side can be in paper or live at
+    the same time, in either combination.
+    """
+
+    enabled: bool = False
+    exchange: str = "binance"
+    mode: str = "paper"  # paper | live
+    pairs: tuple[str, ...] = ()  # e.g. ("BTC/USDT", "ETH/USDT") — one quote currency
+    strategy: str = "trend"  # trend | mean_reversion
+    poll_interval_seconds: int = 300
+    max_capital: Decimal = Decimal(50)
+    per_trade_cap_pct: Decimal = Decimal(25)
+    min_order: Decimal = Decimal(10)
+    max_positions: int = 3
+    max_trades_per_day: int = 10
+    stop_loss_pct: Decimal = Decimal(8)
+    take_profit_pct: Decimal = Decimal(15)
+    min_entry_score: Decimal = Decimal("0.35")
+    max_entry_vol_pct: Decimal = Decimal(80)
+    entry_z: Decimal = Decimal("-1.5")
+    exit_z: Decimal = Decimal("0")
+    quantity_decimals: int = 6
+    indicators: IndicatorConfig = field(default_factory=IndicatorConfig)
+
+    @property
+    def is_live(self) -> bool:
+        return self.mode == "live"
+
+    @property
+    def places_real_orders(self) -> bool:
+        return self.mode == "live"
+
+    @property
+    def per_trade_cap(self) -> Decimal:
+        return self.max_capital * self.per_trade_cap_pct / Decimal(100)
+
+    @property
+    def quote_currency(self) -> str:
+        return self.pairs[0].split("/")[-1] if self.pairs else ""
+
+
+@dataclass(frozen=True)
 class AIConfig:
     provider: str
     timeout_seconds: int
@@ -215,6 +278,8 @@ class Secrets:
     openrouter_api_key: str = ""
     omniroute_api_key: str = ""
     anthropic_api_key: str = ""
+    crypto_api_key: str = ""
+    crypto_api_secret: str = ""
 
     def __repr__(self) -> str:  # pragma: no cover - defensive
         return "Secrets(<redacted>)"
@@ -241,6 +306,7 @@ class AppConfig:
     # instruments where the automatic lookup is wrong or ambiguous.
     symbol_overrides: Mapping[str, str] = field(default_factory=dict)
     instruments_path: Path = Path("data/instruments.json")
+    crypto: CryptoConfig = field(default_factory=CryptoConfig)
 
     @property
     def is_live(self) -> bool:
@@ -377,6 +443,8 @@ def _load_secrets() -> Secrets:
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY", "").strip(),
         omniroute_api_key=os.getenv("OMNIROUTE_API_KEY", "").strip(),
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", "").strip(),
+        crypto_api_key=os.getenv("CRYPTO_API_KEY", "").strip(),
+        crypto_api_secret=os.getenv("CRYPTO_API_SECRET", "").strip(),
     )
 
 
@@ -432,6 +500,121 @@ def resolve_provider(configured: str, secrets: Secrets) -> str:
     if provider == "omniroute" and not secrets.omniroute_api_key:
         raise ConfigError("ai.provider is 'omniroute' but OMNIROUTE_API_KEY is not set")
     return provider
+
+
+def load_crypto_config(
+    raw: Mapping[str, Any], secrets: Secrets, settings_path: Path
+) -> CryptoConfig:
+    """Build the crypto section, overlaid by whatever the dashboard last saved.
+
+    ``raw`` is ``config.yaml``'s ``crypto:`` mapping — the version-controlled
+    defaults. ``settings_path`` (from ``crypto_overlay_paths()``), when
+    present, is the dashboard's own save and wins field-for-field, the same
+    relationship its sibling secrets file has with ``secrets``.
+    """
+    overlay: Mapping[str, Any] = {}
+    if settings_path.exists():
+        try:
+            overlay = json.loads(settings_path.read_text()) or {}
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ConfigError(f"{settings_path}: {exc}") from exc
+        if not isinstance(overlay, Mapping):
+            raise ConfigError(f"{settings_path} must contain a JSON object")
+    merged: dict[str, Any] = {**raw, **overlay}
+
+    pairs_raw = merged.get("pairs") or []
+    if isinstance(pairs_raw, str):
+        pairs_raw = [p.strip() for p in pairs_raw.replace(",", "\n").splitlines() if p.strip()]
+    if not isinstance(pairs_raw, list):
+        raise ConfigError("crypto.pairs must be a list, or a newline/comma separated string")
+    pairs = tuple(str(p).strip().upper() for p in pairs_raw if str(p).strip())
+
+    mode = str(merged.get("mode", "paper")).strip().lower()
+    if mode not in ("paper", "live"):
+        raise ConfigError(f"crypto.mode must be paper|live (got {mode!r})")
+    strategy = str(merged.get("strategy", "trend")).strip().lower()
+    if strategy not in ("trend", "mean_reversion"):
+        raise ConfigError(f"crypto.strategy must be trend|mean_reversion (got {strategy!r})")
+
+    cfg = CryptoConfig(
+        enabled=bool(merged.get("enabled", False)),
+        exchange=str(merged.get("exchange", "binance")).strip().lower(),
+        mode=mode,
+        pairs=pairs,
+        strategy=strategy,
+        poll_interval_seconds=_int(merged, "poll_interval_seconds", "crypto", 300),
+        max_capital=_positive(_dec(merged, "max_capital", "crypto", 50), "crypto.max_capital"),
+        per_trade_cap_pct=_pct(
+            _dec(merged, "per_trade_cap_pct", "crypto", 25), "crypto.per_trade_cap_pct"
+        ),
+        min_order=_positive(_dec(merged, "min_order", "crypto", 10), "crypto.min_order"),
+        max_positions=_int(merged, "max_positions", "crypto", 3),
+        max_trades_per_day=_int(merged, "max_trades_per_day", "crypto", 10),
+        stop_loss_pct=_pct(
+            _dec(merged, "stop_loss_pct", "crypto", 8), "crypto.stop_loss_pct", upper=Decimal(100)
+        ),
+        take_profit_pct=_pct(
+            _dec(merged, "take_profit_pct", "crypto", 15),
+            "crypto.take_profit_pct",
+            upper=Decimal(1000),
+        ),
+        min_entry_score=_dec(merged, "min_entry_score", "crypto", "0.35"),
+        max_entry_vol_pct=_pct(
+            _dec(merged, "max_entry_vol_pct", "crypto", 80),
+            "crypto.max_entry_vol_pct",
+            upper=Decimal(1000),
+        ),
+        entry_z=_dec(merged, "entry_z", "crypto", "-1.5"),
+        exit_z=_dec(merged, "exit_z", "crypto", "0"),
+        quantity_decimals=_int(merged, "quantity_decimals", "crypto", 6),
+    )
+
+    if not (Decimal(0) < cfg.min_entry_score <= Decimal(1)):
+        raise ConfigError("crypto.min_entry_score must be in (0, 1]")
+    if not (0 <= cfg.quantity_decimals <= 12):
+        raise ConfigError("crypto.quantity_decimals must be between 0 and 12")
+    if cfg.poll_interval_seconds < 30:
+        raise ConfigError("crypto.poll_interval_seconds must be at least 30")
+    if cfg.max_positions < 1:
+        raise ConfigError("crypto.max_positions must be at least 1")
+    if cfg.max_trades_per_day < 0:
+        raise ConfigError("crypto.max_trades_per_day must not be negative")
+    if cfg.min_order > cfg.per_trade_cap:
+        raise ConfigError(
+            f"crypto.min_order ({cfg.min_order}) exceeds the per-trade cap "
+            f"({cfg.per_trade_cap}) — no order could ever be approved"
+        )
+
+    if cfg.enabled:
+        if not cfg.pairs:
+            raise ConfigError("crypto.enabled is true but crypto.pairs is empty")
+        if any("/" not in p for p in cfg.pairs):
+            raise ConfigError("crypto.pairs entries must be BASE/QUOTE, e.g. BTC/USDT")
+        quote_currencies = {p.split("/")[-1] for p in cfg.pairs}
+        if len(quote_currencies) != 1:
+            raise ConfigError(
+                "crypto.pairs must all share one quote currency so the capital cap means "
+                f"one thing (got {sorted(quote_currencies)})"
+            )
+        try:
+            import ccxt  # noqa: F401 - only imported to check it is installed
+        except ImportError as exc:
+            raise ConfigError(
+                "crypto.enabled is true but the 'ccxt' package is not installed — "
+                "pip install ccxt"
+            ) from exc
+        if cfg.mode == "live":
+            if not secrets.crypto_api_key:
+                raise ConfigError("crypto.mode is 'live' but CRYPTO_API_KEY is not set")
+            confirmation = os.getenv(LIVE_CONFIRMATION_VAR, "").strip().lower()
+            if confirmation != LIVE_CONFIRMATION_VALUE:
+                raise ConfigError(
+                    "crypto.mode is 'live' but refuses to start without "
+                    f"{LIVE_CONFIRMATION_VAR}={LIVE_CONFIRMATION_VALUE} in the environment. "
+                    "This is real money."
+                )
+
+    return cfg
 
 
 def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env") -> AppConfig:
@@ -671,6 +854,19 @@ def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env"
     if dashboard.quick_buy_gbp <= Decimal(0):
         raise ConfigError("dashboard.quick_buy_gbp must be positive")
 
+    # The dashboard's crypto settings form writes next to the database rather
+    # than into .env/config.yaml (see crypto_overlay_paths' docstring);
+    # override=True so a GUI edit since this process last started always wins.
+    crypto_secrets_path, crypto_settings_path = crypto_overlay_paths(storage.db_path)
+    if crypto_secrets_path.exists():
+        load_dotenv(crypto_secrets_path, override=True)
+        secrets = replace(
+            secrets,
+            crypto_api_key=os.getenv("CRYPTO_API_KEY", "").strip(),
+            crypto_api_secret=os.getenv("CRYPTO_API_SECRET", "").strip(),
+        )
+    crypto = load_crypto_config(_section(data, "crypto"), secrets, crypto_settings_path)
+
     stop_file = Path(str(_section(data, "kill_switch").get("stop_file", "./STOP")))
     watchlist = load_watchlist(data.get("watchlist"))
 
@@ -697,6 +893,7 @@ def load(path: str | Path | None = None, *, env_file: str | Path | None = ".env"
         storage=storage,
         logging=logging_cfg,
         dashboard=dashboard,
+        crypto=crypto,
         stop_file=stop_file,
         watchlist=watchlist,
         t212_base_url=base_url,

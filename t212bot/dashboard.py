@@ -18,13 +18,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, render_template_string, request
 
-from .config import AppConfig, load
+from .config import AppConfig, ConfigError, crypto_overlay_paths, load, load_crypto_config
+from .crypto_engine import CryptoScheduler
 from .indicators import compute_all
 from .models import ZERO, Verdict, dec, money
 from .main import build_runtime, safe_cycle, trading_day
@@ -79,6 +82,15 @@ PAGE = """
     .force-result.ok { background: #e7f0e7; color: #14431b; }
     .force-result.err { background: #fde7cf; color: #6a3a00; }
     .force-result.running { background: #e8eaf6; color: #1a237e; }
+    .stop-btn { background: #b3261e; }
+    .stop-btn:hover { background: #8f1d17; }
+    .settings-grid label { display: block; margin-bottom: .6rem; font-size: .85rem; }
+    .settings-grid input, .settings-grid select, .settings-grid textarea {
+      width: 100%; margin-top: .2rem; padding: .35rem .45rem; border-radius: .3rem;
+      border: 1px solid rgba(128,128,128,.4); background: transparent; color: inherit;
+      font: inherit; box-sizing: border-box;
+    }
+    summary { font-weight: 600; }
   </style>
 </head>
 <body>
@@ -138,6 +150,65 @@ PAGE = """
       💷 Buy &pound;{{ quick_buy_amount }} of the top pick
     </button>
     <div id="quick-buy-result"></div>
+  </div>
+
+  <div class="force-section" id="crypto-section">
+    <h2 style="margin-top:0">Crypto</h2>
+    <p class="muted" style="margin:.2rem 0 .6rem">
+      A second, independent market — no AI, screened with the same trend/RSI/volatility
+      maths used above, trend-following or mean-reversion, medium-term holds with their own
+      stop-loss and take-profit. The same kill switch halts this too.</p>
+
+    <div id="crypto-status-box" class="muted">Loading…</div>
+    <div style="margin:.6rem 0">
+      <button class="force-btn" id="crypto-start-btn" onclick="cryptoStart()">▶ Start</button>
+      <button class="force-btn stop-btn" id="crypto-stop-btn" onclick="cryptoStop()">⏸ Stop</button>
+    </div>
+    <div id="crypto-action-result"></div>
+
+    <h2>Crypto positions</h2>
+    <div id="crypto-positions" class="muted">—</div>
+
+    <h2>Recent crypto trades</h2>
+    <div id="crypto-trades" class="muted">—</div>
+
+    <details style="margin-top:1.2rem">
+      <summary style="cursor:pointer">Settings</summary>
+      <div class="settings-grid" style="margin-top:.6rem">
+        <label>Exchange (a CCXT id, e.g. binance, kraken, coinbase)
+          <input id="cx-exchange" type="text" placeholder="binance"></label>
+        <label>Mode
+          <select id="cx-mode"><option value="paper">paper</option><option value="live">live</option></select></label>
+        <label>Strategy
+          <select id="cx-strategy"><option value="trend">trend-following</option>
+            <option value="mean_reversion">mean-reversion</option></select></label>
+        <label>Pairs — one per line, same quote currency, e.g. BTC/USDT
+          <textarea id="cx-pairs" rows="3" placeholder="BTC/USDT&#10;ETH/USDT"></textarea></label>
+        <label>Poll interval (seconds) <input id="cx-poll" type="number" min="30"></label>
+        <label>Capital cap <input id="cx-capital" type="number" step="any"></label>
+        <label>Per-trade cap % <input id="cx-pertrade" type="number" step="any"></label>
+        <label>Minimum order <input id="cx-minorder" type="number" step="any"></label>
+        <label>Max concurrent positions <input id="cx-maxpos" type="number" min="1"></label>
+        <label>Max trades per day <input id="cx-maxtrades" type="number" min="0"></label>
+        <label>Stop-loss % <input id="cx-stoploss" type="number" step="any"></label>
+        <label>Take-profit % <input id="cx-takeprofit" type="number" step="any"></label>
+        <label>Min entry score — trend strategy <input id="cx-minscore" type="number" step="any"></label>
+        <label>Max volatility % — trend strategy <input id="cx-maxvol" type="number" step="any"></label>
+        <label>Entry z-score — mean-reversion <input id="cx-entryz" type="number" step="any"></label>
+        <label>Exit z-score — mean-reversion <input id="cx-exitz" type="number" step="any"></label>
+        <label>Quantity decimals <input id="cx-qdecimals" type="number" min="0" max="12"></label>
+        <label id="cx-key-label">API key <input id="cx-apikey" type="password"
+          placeholder="leave blank to keep the current key"></label>
+        <label>API secret <input id="cx-apisecret" type="password"
+          placeholder="leave blank to keep the current secret"></label>
+      </div>
+      <button class="force-btn" id="crypto-save-btn" onclick="cryptoSaveSettings()">💾 Save settings</button>
+      <div id="crypto-save-result"></div>
+      <p class="muted" style="margin-top:.6rem">
+        Switching mode to <code>live</code> here is not enough on its own: the machine this
+        runs on also needs <code>I_UNDERSTAND_THIS_IS_REAL_MONEY=yes</code> set in its own
+        environment. That one confirmation is deliberately not in this form.</p>
+    </details>
   </div>
 
   <h2>Open positions</h2>
@@ -310,6 +381,148 @@ PAGE = """
           });
       }, 2000);
     }
+
+    function cryptoLoadSettings() {
+      fetch('/api/crypto/settings').then(function(r) { return r.json(); }).then(function(s) {
+        document.getElementById('cx-exchange').value = s.exchange;
+        document.getElementById('cx-mode').value = s.mode;
+        document.getElementById('cx-strategy').value = s.strategy;
+        document.getElementById('cx-pairs').value = s.pairs.join('\n');
+        document.getElementById('cx-poll').value = s.poll_interval_seconds;
+        document.getElementById('cx-capital').value = s.max_capital;
+        document.getElementById('cx-pertrade').value = s.per_trade_cap_pct;
+        document.getElementById('cx-minorder').value = s.min_order;
+        document.getElementById('cx-maxpos').value = s.max_positions;
+        document.getElementById('cx-maxtrades').value = s.max_trades_per_day;
+        document.getElementById('cx-stoploss').value = s.stop_loss_pct;
+        document.getElementById('cx-takeprofit').value = s.take_profit_pct;
+        document.getElementById('cx-minscore').value = s.min_entry_score;
+        document.getElementById('cx-maxvol').value = s.max_entry_vol_pct;
+        document.getElementById('cx-entryz').value = s.entry_z;
+        document.getElementById('cx-exitz').value = s.exit_z;
+        document.getElementById('cx-qdecimals').value = s.quantity_decimals;
+        document.getElementById('cx-key-label').firstChild.textContent =
+          s.has_api_key ? 'API key (one is already saved) ' : 'API key ';
+      }).catch(function() {});
+    }
+
+    function cryptoSaveSettings() {
+      var btn = document.getElementById('crypto-save-btn');
+      var res = document.getElementById('crypto-save-result');
+      var pairs = document.getElementById('cx-pairs').value
+        .split('\n').map(function(s) { return s.trim(); }).filter(Boolean);
+      var body = {
+        exchange: document.getElementById('cx-exchange').value,
+        mode: document.getElementById('cx-mode').value,
+        strategy: document.getElementById('cx-strategy').value,
+        pairs: pairs,
+        poll_interval_seconds: document.getElementById('cx-poll').value,
+        max_capital: document.getElementById('cx-capital').value,
+        per_trade_cap_pct: document.getElementById('cx-pertrade').value,
+        min_order: document.getElementById('cx-minorder').value,
+        max_positions: document.getElementById('cx-maxpos').value,
+        max_trades_per_day: document.getElementById('cx-maxtrades').value,
+        stop_loss_pct: document.getElementById('cx-stoploss').value,
+        take_profit_pct: document.getElementById('cx-takeprofit').value,
+        min_entry_score: document.getElementById('cx-minscore').value,
+        max_entry_vol_pct: document.getElementById('cx-maxvol').value,
+        entry_z: document.getElementById('cx-entryz').value,
+        exit_z: document.getElementById('cx-exitz').value,
+        quantity_decimals: document.getElementById('cx-qdecimals').value,
+        api_key: document.getElementById('cx-apikey').value,
+        api_secret: document.getElementById('cx-apisecret').value
+      };
+      btn.disabled = true;
+      res.className = 'force-result running';
+      res.textContent = 'Saving…';
+      fetch('/api/crypto/settings', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      }).then(function(r) { return r.json().then(function(data) { return { ok: r.ok, data: data }; }); })
+        .then(function(result) {
+          btn.disabled = false;
+          document.getElementById('cx-apikey').value = '';
+          document.getElementById('cx-apisecret').value = '';
+          if (!result.ok) {
+            res.className = 'force-result err';
+            res.textContent = '✗ ' + (result.data.error || 'save failed');
+            return;
+          }
+          res.className = 'force-result ok';
+          res.textContent = '✓ saved' + (result.data.running ? ' — engine running' : ' — engine stopped');
+          cryptoLoadSettings();
+          cryptoRefreshStatus();
+        })
+        .catch(function(err) {
+          btn.disabled = false;
+          res.className = 'force-result err';
+          res.textContent = '✗ request failed: ' + err;
+        });
+    }
+
+    function cryptoStart() { cryptoToggle('/api/crypto/start'); }
+    function cryptoStop() { cryptoToggle('/api/crypto/stop'); }
+
+    function cryptoToggle(url) {
+      var res = document.getElementById('crypto-action-result');
+      res.className = 'force-result running';
+      res.textContent = 'Working…';
+      fetch(url, { method: 'POST' })
+        .then(function(r) { return r.json().then(function(data) { return { ok: r.ok, data: data }; }); })
+        .then(function(result) {
+          if (!result.ok) {
+            res.className = 'force-result err';
+            res.textContent = '✗ ' + (result.data.error || 'request failed');
+            return;
+          }
+          res.className = 'force-result ok';
+          res.textContent = result.data.running ? '✓ running' : '✓ stopped';
+          cryptoRefreshStatus();
+        })
+        .catch(function(err) {
+          res.className = 'force-result err';
+          res.textContent = '✗ request failed: ' + err;
+        });
+    }
+
+    function cryptoRefreshStatus() {
+      fetch('/api/crypto/status').then(function(r) { return r.json(); }).then(function(s) {
+        var box = document.getElementById('crypto-status-box');
+        box.textContent = (s.running ? 'Running' : 'Stopped') + ' — mode ' + s.mode +
+          (s.cash !== null ? ', paper cash ' + s.cash : '') +
+          (s.last_result && s.last_result.halted ? ' — HALTED: ' + s.last_result.halted : '') +
+          (s.last_result && s.last_result.started_at ? ' — last cycle ' + s.last_result.started_at : '');
+
+        var positions = document.getElementById('crypto-positions');
+        if (s.positions.length === 0) {
+          positions.textContent = 'No open crypto positions.';
+        } else {
+          positions.innerHTML = '<table><tr><th>Symbol</th><th class="num">Qty</th>' +
+            '<th class="num">Avg</th><th>Opened</th></tr>' + s.positions.map(function(p) {
+              return '<tr><td>' + p.symbol + '</td><td class="num">' + p.quantity +
+                '</td><td class="num">' + p.average_price + '</td><td class="muted">' +
+                p.opened_at.slice(0, 16).replace('T', ' ') + '</td></tr>';
+            }).join('') + '</table>';
+        }
+
+        var trades = document.getElementById('crypto-trades');
+        if (s.recent_trades.length === 0) {
+          trades.textContent = 'No crypto trades yet.';
+        } else {
+          trades.innerHTML = '<table><tr><th>When</th><th>Side</th><th>Symbol</th>' +
+            '<th class="num">Qty</th><th class="num">Price</th><th>Reason</th></tr>' +
+            s.recent_trades.map(function(t) {
+              return '<tr><td class="muted">' + t.created_at.slice(0, 16).replace('T', ' ') +
+                '</td><td>' + t.side + '</td><td>' + t.symbol + '</td><td class="num">' +
+                t.quantity + '</td><td class="num">' + t.price + '</td><td class="muted">' +
+                (t.error || t.reason || '') + '</td></tr>';
+            }).join('') + '</table>';
+        }
+      }).catch(function() {});
+    }
+
+    cryptoLoadSettings();
+    cryptoRefreshStatus();
+    setInterval(cryptoRefreshStatus, 5000);
   </script>
 </body>
 </html>
@@ -519,10 +732,100 @@ def _run_quick_buy(run_id: str, config: AppConfig) -> None:
         log.exception("quick-buy %s failed", run_id[:8])
 
 
+# --------------------------------------------------------------------------- #
+# Crypto: settings saved by the GUI, and the background engine it drives
+# --------------------------------------------------------------------------- #
+
+
+def _apply_crypto_settings(
+    config: AppConfig,
+    fields: dict,
+    api_key: str | None,
+    api_secret: str | None,
+) -> AppConfig:
+    """Merge ``fields`` into the saved crypto overlay and return a new config.
+
+    Writes next to the database (``crypto_overlay_paths``), never into .env or
+    config.yaml — see that function's docstring for why. Only the crypto slice
+    of ``config`` changes; everything else (the stock side, AI, dashboard
+    settings) is untouched. Raises ``ConfigError`` on anything invalid, same
+    as a normal config.yaml edit would.
+    """
+    secrets_path, settings_path = crypto_overlay_paths(config.storage.db_path)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing: dict = {}
+    if settings_path.exists():
+        try:
+            existing = json.loads(settings_path.read_text()) or {}
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+    existing.update(fields)
+    settings_path.write_text(json.dumps(existing, indent=2, default=str))
+
+    secrets = config.secrets
+    if api_key or api_secret:
+        secrets_path.parent.mkdir(parents=True, exist_ok=True)
+        new_key = api_key or secrets.crypto_api_key
+        new_secret = api_secret or secrets.crypto_api_secret
+        secrets_path.write_text(f"CRYPTO_API_KEY={new_key}\nCRYPTO_API_SECRET={new_secret}\n")
+        # Take effect immediately in this process, without waiting on a reload
+        # to re-read the file we just wrote.
+        os.environ["CRYPTO_API_KEY"] = new_key
+        os.environ["CRYPTO_API_SECRET"] = new_secret
+        secrets = replace(secrets, crypto_api_key=new_key, crypto_api_secret=new_secret)
+
+    new_crypto = load_crypto_config({}, secrets, settings_path)
+    return replace(config, crypto=new_crypto, secrets=secrets)
+
+
+def _crypto_settings_public(config: AppConfig) -> dict:
+    c = config.crypto
+    return {
+        "enabled": c.enabled,
+        "exchange": c.exchange,
+        "mode": c.mode,
+        "pairs": list(c.pairs),
+        "strategy": c.strategy,
+        "poll_interval_seconds": c.poll_interval_seconds,
+        "max_capital": str(c.max_capital),
+        "per_trade_cap_pct": str(c.per_trade_cap_pct),
+        "min_order": str(c.min_order),
+        "max_positions": c.max_positions,
+        "max_trades_per_day": c.max_trades_per_day,
+        "stop_loss_pct": str(c.stop_loss_pct),
+        "take_profit_pct": str(c.take_profit_pct),
+        "min_entry_score": str(c.min_entry_score),
+        "max_entry_vol_pct": str(c.max_entry_vol_pct),
+        "entry_z": str(c.entry_z),
+        "exit_z": str(c.exit_z),
+        "quantity_decimals": c.quantity_decimals,
+        "has_api_key": bool(config.secrets.crypto_api_key),
+    }
+
+
+_CRYPTO_SETTINGS_FIELDS = (
+    "enabled", "exchange", "mode", "strategy", "pairs", "poll_interval_seconds",
+    "max_capital", "per_trade_cap_pct", "min_order", "max_positions", "max_trades_per_day",
+    "stop_loss_pct", "take_profit_pct", "min_entry_score", "max_entry_vol_pct",
+    "entry_z", "exit_z", "quantity_decimals",
+)
+
+
 def create_app(config: AppConfig | None = None) -> Flask:
     config = config or load()
     storage = Storage(config.storage.db_path)
     app = Flask(__name__)
+
+    # The stock side's ``config`` above is never reassigned — only the crypto
+    # settings form changes anything at runtime, and it changes only the
+    # crypto slice. ``_cfg`` is the one mutable reference to the *current*
+    # config, read by every crypto route; everything else keeps closing over
+    # the original ``config``.
+    _cfg = {"value": config}
+    crypto_scheduler = CryptoScheduler(config, storage)
+    if config.crypto.enabled:
+        crypto_scheduler.start()
 
     @app.get("/")
     def index() -> str:
@@ -618,6 +921,81 @@ def create_app(config: AppConfig | None = None) -> Flask:
         if entry is None:
             return jsonify({"error": "Unknown quick-buy id."}), 404
         return jsonify(entry)
+
+    @app.get("/api/crypto/settings")
+    def crypto_settings_get():
+        return jsonify(_crypto_settings_public(_cfg["value"]))
+
+    @app.post("/api/crypto/settings")
+    def crypto_settings_save():
+        body = request.get_json(silent=True) or {}
+        fields = {k: body[k] for k in _CRYPTO_SETTINGS_FIELDS if k in body}
+        try:
+            new_config = _apply_crypto_settings(
+                _cfg["value"], fields, body.get("api_key"), body.get("api_secret")
+            )
+        except ConfigError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        _cfg["value"] = new_config
+        crypto_scheduler.stop()
+        crypto_scheduler.reconfigure(new_config)
+        if new_config.crypto.enabled:
+            crypto_scheduler.start()
+        log.warning(
+            "crypto settings saved from dashboard: exchange=%s mode=%s strategy=%s pairs=%s",
+            new_config.crypto.exchange, new_config.crypto.mode, new_config.crypto.strategy,
+            ", ".join(new_config.crypto.pairs),
+        )
+        return jsonify({"ok": True, "running": crypto_scheduler.running, **_crypto_settings_public(new_config)})
+
+    @app.post("/api/crypto/start")
+    def crypto_start():
+        current = _cfg["value"]
+        if not current.crypto.pairs:
+            return jsonify({"error": "no crypto pairs configured yet — save settings first"}), 400
+        try:
+            new_config = _apply_crypto_settings(current, {"enabled": True}, None, None)
+        except ConfigError as exc:
+            return jsonify({"error": str(exc)}), 400
+        _cfg["value"] = new_config
+        crypto_scheduler.reconfigure(new_config)
+        crypto_scheduler.start()
+        log.warning("crypto engine started from dashboard")
+        return jsonify({"running": True})
+
+    @app.post("/api/crypto/stop")
+    def crypto_stop():
+        current = _cfg["value"]
+        new_config = _apply_crypto_settings(current, {"enabled": False}, None, None)
+        _cfg["value"] = new_config
+        crypto_scheduler.stop()
+        log.warning("crypto engine stopped from dashboard")
+        return jsonify({"running": False})
+
+    @app.get("/api/crypto/status")
+    def crypto_status():
+        current = _cfg["value"]
+        positions = [
+            {
+                "symbol": symbol,
+                "quantity": str(quantity),
+                "average_price": str(average_price),
+                "opened_at": opened_at.isoformat(),
+            }
+            for symbol, (quantity, average_price, opened_at) in storage.crypto_positions().items()
+        ]
+        return jsonify(
+            {
+                "enabled": current.crypto.enabled,
+                "running": crypto_scheduler.running,
+                "mode": current.crypto.mode,
+                "last_result": crypto_scheduler.last_result,
+                "cash": str(storage.crypto_cash()) if current.crypto.mode == "paper" else None,
+                "positions": positions,
+                "recent_trades": storage.recent_crypto_trades(10),
+            }
+        )
 
     @app.get("/healthz")
     def healthz():

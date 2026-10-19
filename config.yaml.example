@@ -206,6 +206,41 @@ dashboard:
   port: 8080
 
 # ---------------------------------------------------------------------------
+# Crypto — a second, independent market the dashboard can run.
+#
+# No AI: it screens `pairs` with the same technical-analysis maths as
+# ai.indicators/local_strategy above (SMA trend, RSI, volatility, momentum),
+# and trades `trend`-following or `mean_reversion`. Everything here is also
+# editable from the dashboard's Crypto settings panel — a save there writes
+# next to the database (data/crypto_settings.json, data/crypto_secrets.env),
+# and overrides whatever is below field-for-field, so this block is really
+# just the starting default.
+#
+# Going `mode: live` also needs I_UNDERSTAND_THIS_IS_REAL_MONEY=yes in the
+# environment, same as the top-level MODE=live for Trading212 — that
+# confirmation is never settable from the dashboard, on purpose.
+# ---------------------------------------------------------------------------
+crypto:
+  enabled: false
+  exchange: binance          # any CCXT exchange id
+  mode: paper                 # paper | live — independent of the top-level MODE
+  pairs: []                   # e.g. ["BTC/USDT", "ETH/USDT"] — one quote currency
+  strategy: trend              # trend | mean_reversion
+  poll_interval_seconds: 300
+  max_capital: 50              # cap, in the pairs' quote currency
+  per_trade_cap_pct: 25.0
+  min_order: 10
+  max_positions: 3
+  max_trades_per_day: 10
+  stop_loss_pct: 8.0
+  take_profit_pct: 15.0
+  min_entry_score: 0.35        # trend strategy's entry bar (same scale as local_strategy)
+  max_entry_vol_pct: 80.0      # trend strategy; crypto runs hotter than stocks
+  entry_z: -1.5                # mean_reversion: buy below this z-score (oversold)
+  exit_z: 0                    # mean_reversion: sell at/above this z-score
+  quantity_decimals: 6
+
+# ---------------------------------------------------------------------------
 # The allow-list. The AI can ONLY act on tickers listed here; anything else is
 # rejected by risk_manager before it reaches the broker.
 #

@@ -165,6 +165,39 @@ CREATE TABLE IF NOT EXISTS ai_cycle_state (
     action      TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
+
+-- Crypto side: entirely separate from the stock-side tables above. One
+-- symbol is opened by at most one buy and closed by at most one sell — no
+-- averaging-in — so a row existing is exactly "this pair is held".
+CREATE TABLE IF NOT EXISTS crypto_cash (
+    id        INTEGER PRIMARY KEY CHECK (id = 1),
+    cash      TEXT NOT NULL,
+    seeded_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS crypto_positions (
+    symbol        TEXT PRIMARY KEY,
+    quantity      TEXT NOT NULL,
+    average_price TEXT NOT NULL,
+    opened_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS crypto_trades (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    mode       TEXT NOT NULL,
+    symbol     TEXT NOT NULL,
+    side       TEXT NOT NULL,
+    quantity   TEXT NOT NULL,
+    price      TEXT NOT NULL,
+    notional   TEXT NOT NULL,
+    strategy   TEXT NOT NULL,
+    reason     TEXT,
+    order_id   TEXT,
+    realised_pnl TEXT,
+    error      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_crypto_trades_created ON crypto_trades (created_at);
 """
 
 
@@ -589,6 +622,116 @@ class Storage:
     def reset_breaker(self) -> bool:
         cursor = self._write("DELETE FROM breaker WHERE id = 1")
         return bool(cursor.rowcount)
+
+    # ----------------------------------------------------------------- crypto
+    def seed_crypto_cash(self, cash: Decimal, *, force: bool = False) -> Decimal:
+        row = self._read_one("SELECT cash FROM crypto_cash WHERE id = 1")
+        if row is not None and not force:
+            return dec(row["cash"])
+        self._write(
+            "INSERT INTO crypto_cash (id, cash, seeded_at) VALUES (1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET cash = excluded.cash, seeded_at = excluded.seeded_at",
+            (str(cash), utcnow().isoformat()),
+        )
+        return cash
+
+    def crypto_cash(self) -> Decimal:
+        row = self._read_one("SELECT cash FROM crypto_cash WHERE id = 1")
+        return dec(row["cash"]) if row else ZERO
+
+    def adjust_crypto_cash(self, delta: Decimal) -> Decimal:
+        """Apply ``delta`` (signed) to the crypto cash balance. Returns the new total."""
+        with self._lock:
+            row = self._conn.execute("SELECT cash FROM crypto_cash WHERE id = 1").fetchone()
+            total = (dec(row["cash"]) if row else ZERO) + delta
+            self._conn.execute(
+                "INSERT INTO crypto_cash (id, cash, seeded_at) VALUES (1, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET cash = excluded.cash",
+                (str(total), utcnow().isoformat()),
+            )
+            self._conn.commit()
+        return total
+
+    def crypto_position(self, symbol: str) -> tuple[Decimal, Decimal, datetime] | None:
+        """``(quantity, average_price, opened_at)`` for one symbol, or None."""
+        row = self._read_one(
+            "SELECT quantity, average_price, opened_at FROM crypto_positions WHERE symbol = ?",
+            (symbol,),
+        )
+        if row is None:
+            return None
+        return dec(row["quantity"]), dec(row["average_price"]), datetime.fromisoformat(row["opened_at"])
+
+    def crypto_positions(self) -> dict[str, tuple[Decimal, Decimal, datetime]]:
+        return {
+            r["symbol"]: (
+                dec(r["quantity"]),
+                dec(r["average_price"]),
+                datetime.fromisoformat(r["opened_at"]),
+            )
+            for r in self._read("SELECT * FROM crypto_positions")
+        }
+
+    def open_crypto_position(self, symbol: str, quantity: Decimal, average_price: Decimal) -> None:
+        self._write(
+            "INSERT INTO crypto_positions (symbol, quantity, average_price, opened_at) "
+            "VALUES (?,?,?,?) ON CONFLICT(symbol) DO UPDATE SET quantity = excluded.quantity, "
+            "average_price = excluded.average_price, opened_at = excluded.opened_at",
+            (symbol, str(quantity), str(average_price), utcnow().isoformat()),
+        )
+
+    def close_crypto_position(self, symbol: str) -> None:
+        self._write("DELETE FROM crypto_positions WHERE symbol = ?", (symbol,))
+
+    def record_crypto_trade(
+        self,
+        *,
+        mode: str,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        price: Decimal,
+        notional: Decimal,
+        strategy: str,
+        reason: str = "",
+        order_id: str | None = None,
+        realised_pnl: Decimal | None = None,
+        error: str | None = None,
+    ) -> None:
+        self._write(
+            "INSERT INTO crypto_trades (created_at, mode, symbol, side, quantity, price, "
+            "notional, strategy, reason, order_id, realised_pnl, error) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                utcnow().isoformat(),
+                mode,
+                symbol,
+                side,
+                str(quantity),
+                str(price),
+                str(notional),
+                strategy,
+                reason,
+                order_id,
+                _txt(realised_pnl),
+                error,
+            ),
+        )
+
+    def crypto_trades_today(self) -> int:
+        today = utcnow().date().isoformat()
+        row = self._read_one(
+            "SELECT COUNT(*) AS n FROM crypto_trades WHERE substr(created_at, 1, 10) = ? "
+            "AND error IS NULL",
+            (today,),
+        )
+        return int(row["n"]) if row else 0
+
+    def recent_crypto_trades(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self._read(
+            "SELECT * FROM crypto_trades ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
+        return [dict(r) for r in rows]
 
     # ------------------------------------------------------------- dashboard
     def recent_decisions(self, limit: int = 10) -> list[dict[str, Any]]:
