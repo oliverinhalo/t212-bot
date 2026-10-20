@@ -508,13 +508,20 @@ stop-loss and take-profit. It talks to an exchange via
 [CCXT](https://github.com/ccxt/ccxt) (`pip install ccxt`, or it refuses to
 start) — any exchange CCXT supports, e.g. `binance`, `kraken`, `coinbase`.
 
-Everything is editable from the dashboard's **Crypto** section — exchange,
-pairs, strategy, caps, and the API key itself — with **Start**/**Stop**
-buttons and a live view of open positions and recent trades. A save there
-writes next to the database (`data/crypto_secrets.env`,
-`data/crypto_settings.json`), never into `.env`/`config.yaml`, and overrides
-`config.yaml`'s `crypto:` section field-for-field; see `config.yaml.example`
-for every setting and its default.
+It has its own page, `/crypto`, linked from the main dashboard — a separate
+market gets a separate page rather than a section bolted onto the Trading212
+one. Every setting (exchange, pairs, strategy, every cap/threshold, mode,
+and the API key itself) is editable there, each with a plain-language
+description and an expandable "what does this do?" explaining the actual
+effect of changing it — no need to come back to this README to use it. A
+paper/live switch sits at the top. **Start**/**Stop** buttons and a live view
+of open positions and recent trades sit above the settings. A save writes
+next to the database (`data/crypto_secrets.env`, `data/crypto_settings.json`),
+never into `.env`/`config.yaml`, and overrides `config.yaml`'s `crypto:`
+section field-for-field — so editing `config.yaml` and restarting works, and
+so does saving from `/crypto`; whichever happened most recently for a given
+field wins, same as any other config. See `config.yaml.example` for every
+setting and its default.
 
 It is independent of the Trading212 side on purpose:
 

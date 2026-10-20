@@ -152,8 +152,21 @@ def test_status_reports_positions_and_trades(client: FlaskClient, config):
     assert len(status["recent_trades"]) == 1
 
 
-def test_the_dashboard_page_still_renders_with_the_crypto_section(client: FlaskClient):
+def test_the_main_dashboard_links_to_the_separate_crypto_page(client: FlaskClient):
     resp = client.get("/")
     assert resp.status_code == 200
-    assert b"Crypto" in resp.data
+    assert b'href="/crypto"' in resp.data
+    # The settings form itself lives on its own page now, not embedded here.
+    assert b"crypto-start-btn" not in resp.data
+
+
+def test_the_crypto_page_renders_on_its_own_with_sections_and_help_text(client: FlaskClient):
+    resp = client.get("/crypto")
+    assert resp.status_code == 200
+    assert b"t212-bot" in resp.data
     assert b"crypto-start-btn" in resp.data
+    assert b"crypto-save-btn" in resp.data
+    assert b"Strategy" in resp.data
+    assert b"Risk and capital" in resp.data
+    assert b"What does this do?" in resp.data
+    assert b'href="/"' in resp.data
