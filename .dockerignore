@@ -1,0 +1,26 @@
+# Secrets and local state — never baked into the image; .env/config.yaml/
+# data/ are bind-mounted at runtime instead (see docker-compose.yml).
+.env
+.env.*
+!.env.example
+config.yaml
+data/
+*.sqlite3
+*.sqlite3-journal
+*.log
+STOP
+
+.git/
+.github/
+.claude/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+deploy/

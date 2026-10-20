@@ -28,6 +28,7 @@ two separate environment variables.**
 - [The dashboard](#the-dashboard)
 - [Crypto](#crypto)
 - [Running as a service](#running-as-a-service)
+- [Docker](#docker)
 - [Tests](#tests)
 - [Going live](#going-live)
 - [Assumptions and caveats](#assumptions-and-caveats)
@@ -555,6 +556,31 @@ journalctl -u t212-bot -f
 `Restart=on-failure` with `RestartSec=60`. Note that a restart does not clear
 the circuit breaker or an unresolved order — both live in SQLite and both
 require a deliberate command.
+
+---
+
+## Docker
+
+An alternative to the systemd deploy above — same two processes, one image:
+
+```bash
+cp .env.example .env            # fill in; keep MODE=paper until you trust it
+cp config.yaml.example config.yaml
+mkdir -p data
+docker compose up -d --build
+docker compose logs -f
+```
+
+`.env`, `config.yaml`, and `data/` are bind-mounted, never baked into the
+image — editing them and running `docker compose restart` behaves exactly
+like editing them and restarting the systemd units. Both containers share
+one `data/` volume (one SQLite file in WAL mode, same as the two systemd
+services already share), and the dashboard's crypto settings form writes
+into that same volume at runtime, so nothing extra needs mounting for it.
+
+The dashboard container publishes **127.0.0.1:8080 only** — there is no
+authentication on it (see [The dashboard](#the-dashboard)), so put a reverse
+proxy with its own TLS/auth in front rather than exposing the port directly.
 
 ---
 

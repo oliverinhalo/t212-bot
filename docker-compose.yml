@@ -1,0 +1,47 @@
+# Two containers from one image — the same split as the systemd deploy in
+# deploy/ (t212-bot.service + t212-bot-dashboard.service), with the same
+# shared data/ directory (one SQLite file, WAL mode already handles the two
+# processes touching it) and the same config/secrets kept out of the image.
+#
+#   cp .env.example .env            # fill in, keep MODE=paper until ready
+#   cp config.yaml.example config.yaml
+#   mkdir -p data
+#   docker compose up -d --build
+#
+# The dashboard's crypto settings form writes into data/ at runtime (see
+# config.py's crypto_overlay_paths) — the same data/ volume below already
+# covers it, no extra mount needed.
+
+services:
+  bot:
+    build: .
+    image: t212-bot:latest
+    container_name: t212-bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+    command: ["python", "-m", "t212bot.main"]
+
+  dashboard:
+    build: .
+    image: t212-bot:latest
+    container_name: t212-bot-dashboard
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+    command: ["python", "-m", "t212bot.dashboard"]
+    # Loopback only: there is no authentication on the dashboard (see
+    # README's "The dashboard" section) — put nginx (or another reverse
+    # proxy with its own auth/TLS) in front of this, never expose it as-is.
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
