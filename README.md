@@ -26,7 +26,9 @@ two separate environment variables.**
 - [Making it actually trade](#making-it-actually-trade)
 - [The audit log](#the-audit-log)
 - [The dashboard](#the-dashboard)
+- [Crypto](#crypto)
 - [Running as a service](#running-as-a-service)
+- [Docker](#docker)
 - [Tests](#tests)
 - [Going live](#going-live)
 - [Assumptions and caveats](#assumptions-and-caveats)
@@ -495,6 +497,59 @@ not expose it to the internet.
 
 ---
 
+## Crypto
+
+A second, independent market, entirely optional and off by default
+(`crypto.enabled: false`). No AI: it screens a list of pairs with the same
+technical-analysis maths `ai.indicators`/`local_strategy` already use for
+Trading212 (SMA trend, RSI, volatility, momentum) and trades either
+`trend`-following or `mean_reversion`, for a medium-term hold with its own
+stop-loss and take-profit. It talks to an exchange via
+[CCXT](https://github.com/ccxt/ccxt) (`pip install ccxt`, or it refuses to
+start) — any exchange CCXT supports, e.g. `binance`, `kraken`, `coinbase`.
+
+It has its own page, `/crypto`, linked from the main dashboard — a separate
+market gets a separate page rather than a section bolted onto the Trading212
+one. Every setting (exchange, pairs, strategy, every cap/threshold, mode,
+and the API key itself) is editable there, each with a plain-language
+description and an expandable "what does this do?" explaining the actual
+effect of changing it — no need to come back to this README to use it. A
+paper/live switch sits at the top. **Start**/**Stop** buttons and a live view
+of open positions and recent trades sit above the settings. A save writes
+next to the database (`data/crypto_secrets.env`, `data/crypto_settings.json`),
+never into `.env`/`config.yaml`, and overrides `config.yaml`'s `crypto:`
+section field-for-field — so editing `config.yaml` and restarting works, and
+so does saving from `/crypto`; whichever happened most recently for a given
+field wins, same as any other config. See `config.yaml.example` for every
+setting and its default.
+
+It is independent of the Trading212 side on purpose:
+
+- Its own `mode: paper | live`, separate from the top-level `MODE` — either
+  side can be live while the other is paper.
+- Its own capital cap, per-trade cap, and position limit, in the pairs' quote
+  currency (all configured pairs must share one, e.g. all `.../USDT`).
+- Its own small position ledger (`crypto_positions`/`crypto_trades` in the
+  same SQLite file) — no averaging in: one buy opens a pair, one sell (a
+  stop-loss, a take-profit, or a trend/mean-reversion exit) closes it.
+- **No circuit breaker and no daily-loss halt** — unlike the Trading212 side,
+  there is currently nothing that stops crypto trading on a bad day beyond
+  each position's own stop-loss. Keep the capital cap small until that
+  changes.
+
+What it does share: the kill switch. `touch STOP` halts both sides from the
+same file. And the same real-money confirmation —
+`crypto.mode: live` additionally needs `I_UNDERSTAND_THIS_IS_REAL_MONEY=yes`
+set in the environment on the machine itself, which is deliberately **not**
+something the dashboard form can set for you.
+
+The engine runs as a background thread inside the dashboard process (started
+by the **Start** button, or automatically on boot if it was left enabled) —
+not a separate systemd service, so `deploy/update.sh` needs no changes for
+it.
+
+---
+
 ## Running as a service
 
 `./deploy/install.sh` (as root) installs two hardened systemd units:
@@ -511,13 +566,38 @@ require a deliberate command.
 
 ---
 
+## Docker
+
+An alternative to the systemd deploy above — same two processes, one image:
+
+```bash
+cp .env.example .env            # fill in; keep MODE=paper until you trust it
+cp config.yaml.example config.yaml
+mkdir -p data
+docker compose up -d --build
+docker compose logs -f
+```
+
+`.env`, `config.yaml`, and `data/` are bind-mounted, never baked into the
+image — editing them and running `docker compose restart` behaves exactly
+like editing them and restarting the systemd units. Both containers share
+one `data/` volume (one SQLite file in WAL mode, same as the two systemd
+services already share), and the dashboard's crypto settings form writes
+into that same volume at runtime, so nothing extra needs mounting for it.
+
+The dashboard container publishes **127.0.0.1:8080 only** — there is no
+authentication on it (see [The dashboard](#the-dashboard)), so put a reverse
+proxy with its own TLS/auth in front rather than exposing the port directly.
+
+---
+
 ## Tests
 
 ```bash
 .venv/bin/python -m pytest
 ```
 
-224 tests, ~0.5s, no network. `tests/test_risk_manager.py` is the real
+455 tests, ~3s, no network. `tests/test_risk_manager.py` is the real
 specification: if a rule above is not asserted there, treat it as
 unimplemented. It covers zero cash, every cap binding in turn, the breaker at
 and either side of its threshold, the duplicate-order guard across a simulated

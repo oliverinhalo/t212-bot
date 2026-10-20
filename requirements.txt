@@ -9,3 +9,8 @@ Flask>=3.0            # dashboard.py only
 # Install this only if you want to use the Anthropic API provider:
 #   pip install "anthropic>=1.0,<2"
 # anthropic 1.x is built on httpx2, which installs alongside httpx without conflict.
+
+# Crypto trading (t212bot/crypto_client.py). Only required when crypto.enabled
+# is true in config.yaml / the dashboard's crypto settings; config.load()
+# checks for it itself and gives a clear error if it's missing.
+ccxt>=4.0,<5
